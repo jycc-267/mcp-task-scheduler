@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.ipynb_checkpoints
+
+.DS_Store
+
+# Virtual environments
+.venv/
+
+# Agent files
+.agents/
+AGENTS.md
+GEMINI.md
+
+# context files
+contexts/
