@@ -1,237 +1,114 @@
-"""MCP server for the task scheduler.
-
-Run as a stdio MCP server:
-    python -m app.mcp_server
-
-Or test with the inspector:
-    npx @modelcontextprotocol/inspector python -m app.mcp_server
-"""
-
-import asyncio
-import json
+import argparse
 from datetime import datetime
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
-from sqlalchemy.orm import Session
+from fastmcp import FastMCP
 
-from .database import Base, SessionLocal, engine
-from .models import Job
-from .scheduler import get_time_bucket, start_scheduler
+from app.database import Base, SessionLocal, engine
+from app.models import Job
+from app.scheduler import get_time_bucket, start_scheduler
 
+import os
 
 # ===================================================================
-# Tool handlers — pure business logic, sync, take a DB Session
+# MCP server wiring
 # ===================================================================
 
+mcp = FastMCP("task-scheduler")
 
-def handle_create_task(db: Session, *, description: str, scheduled_at: str) -> dict:
-    """Create a new scheduled job."""
-    dt = datetime.fromisoformat(scheduled_at)
-    job = Job(
-        description=description,
-        scheduled_at=dt,
-        time_bucket=get_time_bucket(dt),
-    )
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-    return {"job_id": job.id, "status": job.status, "scheduled_at": str(job.scheduled_at)}
-
-
-def handle_get_status(db: Session, *, job_id: int) -> dict:
-    """Get the status of a scheduled job."""
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if job is None:
-        return {"error": f"Job {job_id} not found"}
-    return {
-        "job_id": job.id,
-        "description": job.description,
-        "status": job.status,
-        "scheduled_at": str(job.scheduled_at),
-        "result": job.result,
-    }
-
-
-def handle_list_tasks(db: Session) -> dict:
-    """List all scheduled jobs."""
-    jobs = db.query(Job).order_by(Job.scheduled_at.desc()).all()
-    return {
-        "jobs": [
-            {
-                "job_id": j.id,
-                "description": j.description,
-                "status": j.status,
-                "scheduled_at": str(j.scheduled_at),
-            }
-            for j in jobs
-        ]
-    }
-
-
-def handle_cancel_task(db: Session, *, job_id: int) -> dict:
-    """Cancel a scheduled job."""
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if job is None:
-        return {"error": f"Job {job_id} not found"}
-    if job.status in ("completed", "failed"):
-        return {"error": f"Cannot cancel job in '{job.status}' state"}
-    job.status = "cancelled"
-    db.commit()
-    return {"job_id": job.id, "status": "cancelled"} # think about ttl, this is soft delete ? or should i set deleted_at ?
-
-
-# ===================================================================
-# Tool definitions — what Claude / MCP client sees
-# ===================================================================
-
-TOOL_DEFINITIONS: list[Tool] = [
-    Tool(
-        name="task_create",
-        description="Schedule a new task for future execution",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "description": {
-                    "type": "string",
-                    "description": "What the task should do",
-                },
-                "scheduled_at": {
-                    "type": "string",
-                    "format": "date-time",
-                    "description": "When to run, ISO 8601 format (e.g. 2026-05-03T10:00:00)",
-                },
-            },
-            "required": ["description", "scheduled_at"],
-        },
-    ),
-    Tool(
-        name="task_list",
-        description="List all scheduled tasks",
-        inputSchema={"type": "object", "properties": {}},
-    ),
-    Tool(
-        name="task_status",
-        description="Get the status of a scheduled task by job_id",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "job_id": {"type": "integer", "description": "The job ID returned by task_create"},
-            },
-            "required": ["job_id"],
-        },
-    ),
-    Tool(
-        name="task_cancel",
-        description="Cancel a scheduled task that hasn't completed yet",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "job_id": {"type": "integer", "description": "The job ID to cancel"},
-            },
-            "required": ["job_id"],
-        },
-    ),
-]
-
-
-# ===================================================================
-# Registry pattern — name to handler dispatch
-# ===================================================================
-
-# TODO: Implement the TOOL_REGISTRY dictionary
-#
-# Design decision: Registry pattern — decouple routing from handlers
-#   so adding a new tool is a one-line change (Open/Closed Principle).
-#   Beats long if-elif chains: easier to test, extend, and reason about.
-#
-# Hints:
-# 1. Map tool name strings to their handler functions
-# 2. Keys should match the tool names from TOOL_DEFINITIONS above
-#    (e.g., "task_create")
-# 3. Values are the handler functions defined earlier in this file
-#    (e.g., handle_create_task)
-# 4. There are 4 tools: task_create, task_list, task_status, task_cancel
-TOOL_REGISTRY: dict = {
-    "task_create": handle_create_task,
-    "task_list": handle_list_tasks,
-    "task_status": handle_get_status,
-    "task_cancel": handle_cancel_task,
-}
-
-
-def route_tool_call(tool_name: str, arguments: dict, db: Session) -> dict:
-    """Single dispatch point — look up handler in TOOL_REGISTRY and call it.
-
-    Called by the async @server.call_tool() wrapper below. Kept sync so
-    handlers can use plain SQLAlchemy without async ceremony.
-    """
-    # TODO: Implement this function
-    #
-    # Design decision: Single dispatch point for all MCP tool calls —
-    #   the LLM sends a tool_name + arguments, and this function routes
-    #   to the correct handler via the registry.
-    #
-    # Hints:
-    # 1. Look up tool_name in TOOL_REGISTRY using dict.get()
-    # 2. If not found, return {"error": f"Unknown tool: {tool_name}"}
-    # 3. If found, call the handler with db and **arguments
-    # 4. Return the handler's result
-    handler = TOOL_REGISTRY.get(tool_name)
+@mcp.tool()
+def task_create(description: str, scheduled_at: str) -> dict:
+    """Schedule a new task for future execution.
     
-    # Return an error if the tool is not found in the registry
-    if not handler:
-        return {"error": f"Unknown tool: {tool_name}"}
-        
-    try:
-        # Pass the database session and unpack the JSON schema arguments 
-        # to match the keyword-only parameters of the handlers.
-        return handler(db, **arguments)
-    except Exception as e:
-        # Catch argument mismatches (e.g., LLM passes unexpected params or omits required ones)
-        return {"error": f"Error calling tool '{tool_name}': {str(e)}"}
+    Args:
+        description: What the task should do
+        scheduled_at: When to run, ISO 8601 format (e.g. 2026-05-03T10:00:00)
+    """
+    with SessionLocal() as db:
+        dt = datetime.fromisoformat(scheduled_at)
+        job = Job(
+            description=description,
+            scheduled_at=dt,
+            time_bucket=get_time_bucket(dt),
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return {"job_id": job.id, "status": job.status, "scheduled_at": str(job.scheduled_at)}
 
+@mcp.tool()
+def task_status(job_id: int) -> dict:
+    """Get the status of a scheduled task by job_id.
+    
+    Args:
+        job_id: The job ID returned by task_create
+    """
+    with SessionLocal() as db:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if job is None:
+            return {"error": f"Job {job_id} not found"}
+        return {
+            "job_id": job.id,
+            "description": job.description,
+            "status": job.status,
+            "scheduled_at": str(job.scheduled_at),
+            "result": job.result,
+        }
+
+@mcp.tool()
+def task_list() -> dict:
+    """List all scheduled tasks."""
+    with SessionLocal() as db:
+        jobs = db.query(Job).order_by(Job.scheduled_at.desc()).all()
+        return {
+            "jobs": [
+                {
+                    "job_id": j.id,
+                    "description": j.description,
+                    "status": j.status,
+                    "scheduled_at": str(j.scheduled_at),
+                }
+                for j in jobs
+            ]
+        }
+
+@mcp.tool()
+def task_cancel(job_id: int) -> dict:
+    """Cancel a scheduled task that hasn't completed yet.
+    
+    Args:
+        job_id: The job ID to cancel
+    """
+    with SessionLocal() as db:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if job is None:
+            return {"error": f"Job {job_id} not found"}
+        if job.status in ("completed", "failed"):
+            return {"error": f"Cannot cancel job in '{job.status}' state"}
+        job.status = "cancelled"
+        db.commit()
+        return {"job_id": job.id, "status": "cancelled"}
 
 # ===================================================================
-# MCP server wiring — boilerplate, do not modify
+# Entry point
 # ===================================================================
 
-server: Server = Server("task-scheduler")
+def main() -> None:
+    # 1. Check for the environment variable first (standard for Horizon/Cloud)
+    default_port = int(os.environ.get("PORT", 8000))
 
+    parser = argparse.ArgumentParser(description="MCP server for the task scheduler.")
+    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio", help="Transport to use (stdio or sse)")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to for SSE transport")
+    parser.add_argument("--port", type=int, default=default_port, help="Port to bind to for SSE transport")
+    args = parser.parse_args()
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    return TOOL_DEFINITIONS
-
-
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Async wrapper — runs the sync handler in a thread to avoid blocking the event loop."""
-    db = SessionLocal()
-    try:
-        result = await asyncio.to_thread(route_tool_call, name, arguments or {}, db)
-    finally:
-        db.close()
-    return [TextContent(type="text", text=json.dumps(result, default=str, ensure_ascii=False))]
-
-
-# ===================================================================
-# Entry point — `python -m app.mcp_server`
-# ===================================================================
-
-
-async def main() -> None:
     Base.metadata.create_all(bind=engine)
     start_scheduler()
 
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
-
+    if args.transport == "sse":
+        mcp.run(transport="sse", host=args.host, port=args.port)
+    else:
+        mcp.run(transport="stdio")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

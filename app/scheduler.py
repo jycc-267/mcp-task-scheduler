@@ -6,8 +6,8 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
-from .database import SessionLocal
-from .models import Job, _utcnow
+from app.database import SessionLocal
+from app.models import Job, _utcnow
 
 # In-memory queue (simulates SQS for prototype)
 job_queue: queue.Queue[int] = queue.Queue()
