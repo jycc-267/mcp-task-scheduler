@@ -16,12 +16,14 @@ import os
 mcp = FastMCP("task-scheduler")
 
 @mcp.tool()
-def task_create(description: str, scheduled_at: str) -> dict:
+def task_create(description: str, scheduled_at: str, cron_expr: str | None = None, parent_job_id: int | None = None) -> dict:
     """Schedule a new task for future execution.
     
     Args:
         description: What the task should do
         scheduled_at: When to run, ISO 8601 format (e.g. 2026-05-03T10:00:00)
+        cron_expr: Optional cron expression for recurring tasks (e.g. '0 9 * * *' for daily at 9am)
+        parent_job_id: Optional ID of a parent job that must complete before this job runs
     """
     with SessionLocal() as db:
         dt = datetime.fromisoformat(scheduled_at)
@@ -29,11 +31,19 @@ def task_create(description: str, scheduled_at: str) -> dict:
             description=description,
             scheduled_at=dt,
             time_bucket=get_time_bucket(dt),
+            cron_expr=cron_expr,
+            parent_job_id=parent_job_id
         )
         db.add(job)
         db.commit()
         db.refresh(job)
-        return {"job_id": job.id, "status": job.status, "scheduled_at": str(job.scheduled_at)}
+        return {
+            "job_id": job.id, 
+            "status": job.status, 
+            "scheduled_at": str(job.scheduled_at),
+            "cron_expr": job.cron_expr,
+            "parent_job_id": job.parent_job_id
+        }
 
 @mcp.tool()
 def task_status(job_id: int) -> dict:
@@ -51,6 +61,8 @@ def task_status(job_id: int) -> dict:
             "description": job.description,
             "status": job.status,
             "scheduled_at": str(job.scheduled_at),
+            "cron_expr": job.cron_expr,
+            "parent_job_id": job.parent_job_id,
             "result": job.result,
         }
 
@@ -66,6 +78,8 @@ def task_list() -> dict:
                     "description": j.description,
                     "status": j.status,
                     "scheduled_at": str(j.scheduled_at),
+                    "cron_expr": j.cron_expr,
+                    "parent_job_id": j.parent_job_id
                 }
                 for j in jobs
             ]

@@ -3,14 +3,15 @@ import threading
 import time
 from datetime import datetime
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 from sqlalchemy import select
+from croniter import croniter
 
 from app.database import SessionLocal
 from app.models import Job, _utcnow
 
-# In-memory queue (simulates SQS for prototype)
-job_queue: queue.Queue[int] = queue.Queue()
+# In-memory, thread-safe, global job queue (simulates SQS for prototype)
+GLOBAL_JOB_QUEUE: queue.Queue[int] = queue.Queue()
 
 
 def get_time_bucket(scheduled_at: datetime) -> str:
@@ -40,23 +41,18 @@ def find_due_jobs(current_time: datetime, db: Session) -> list[Job]:
     then filters for jobs that are due (scheduled_at <= now) and still
     in 'pending' status.
     """
-    # TODO: Implement this function
-    #
-    # Design decision: Watcher pattern — poll DB for due jobs using
-    #   the time bucket as a partition key to avoid full table scans
-    #
-    # Hints:
-    # 1. Compute the current time bucket using get_time_bucket()
-    # 2. Query Job where time_bucket matches AND scheduled_at <= current_time
-    # 3. Only include jobs with status == "pending"
-    # 4. Return the list of matching Job objects
-    # time_bucket <= current_bucket 在 SQLite 或大表中可能太慢，建立一個部分索引 (Partial Index)：
+    ParentJob = aliased(Job)
+
     current_time_bucket = get_time_bucket(current_time)
     query = (
         select(Job)
+        .outerjoin(ParentJob, Job.parent_job_id == ParentJob.id)
         .where(Job.status == "pending")
         .where(Job.time_bucket <= current_time_bucket) # fault-tolerance: 包含過去小時的 bucket，假設有做partition，資料庫會直接跳過「未來」的分區
         .where(Job.scheduled_at <= current_time)   # 過濾「當前小時」中尚未到來的時間點
+        .where(
+            (Job.parent_job_id.is_(None)) | (ParentJob.status == "completed")
+        )
         .order_by(Job.scheduled_at.asc())               # 優先處理最早的任務 (FIFO), prevent starvation; partial index ensure sorting efficiency
         .limit(500) # worker execute this query in background polling, aviod list[Job] fills memory
     )
@@ -79,7 +75,7 @@ def watcher_loop(interval: int = 10):
             for job in due_jobs:
                 job.status = "queued"
                 db.commit()
-                job_queue.put(job.id)
+                GLOBAL_JOB_QUEUE.put(job.id)
         finally:
             db.close()
         time.sleep(interval)
@@ -90,7 +86,7 @@ def watcher_loop(interval: int = 10):
 def worker_loop():
     """Worker pulls jobs from queue and executes them."""
     while True:
-        job_id = job_queue.get()
+        job_id = GLOBAL_JOB_QUEUE.get()
         db = SessionLocal()
         try:
             job = db.query(Job).filter(Job.id == job_id).first()
@@ -103,14 +99,32 @@ def worker_loop():
             # Simulate execution — in production this would call LLM
             job.result = f"Executed: {job.description}"
             job.status = "completed"
+
+            # Check if job is recurring
+            if job.cron_expr:
+                try:
+                    next_time = croniter(job.cron_expr, job.scheduled_at).get_next(datetime)
+                    new_job = Job(
+                        description=job.description,
+                        scheduled_at=next_time,
+                        time_bucket=get_time_bucket(next_time),
+                        cron_expr=job.cron_expr,
+                        parent_job_id=job.parent_job_id
+                    )
+                    db.add(new_job)
+                except Exception as cron_err:
+                    job.logs = f"Cron scheduling failed: {cron_err}"
+
             db.commit()
         except Exception as e:
-            job.status = "failed"
-            job.result = str(e)
-            db.commit()
+            if 'job' in locals() and job:
+                job.status = "failed"
+                job.result = str(e)
+                job.logs = str(e)
+                db.commit()
         finally:
             db.close()
-            job_queue.task_done()
+            GLOBAL_JOB_QUEUE.task_done()
 
 
 def start_scheduler():
