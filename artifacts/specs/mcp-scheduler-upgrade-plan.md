@@ -12,6 +12,8 @@ This plan outlines the upgrade of the existing local `stdio`-based MCP task sche
 - Migrate existing vanilla Python MCP setup to `fastmcp` for decorator-based routing and Pydantic validation.
 - Implement cron-based recurring jobs and dependency-driven job chaining (DAGs).
 - Build an LLM pre-parsing middleware connecting to a live API (e.g., Gemini/Claude) to structure NLP input before internal execution.
+- Update the background worker to act as an LLM client via Gemini API to execute scheduled tasks natively.
+- Implement proactive Server-to-Client notifications to automatically push completed job results to the user's interface.
 - Implement MCP Resources to expose live job details/logs.
 - Implement MCP Prompts, specifically a `daily_review` parameterizable prompt.
 - Ensure all logic is fully testable via `pytest` and managed via `uv`.
@@ -51,14 +53,26 @@ This plan outlines the upgrade of the existing local `stdio`-based MCP task sche
    - Dependencies: Phase 2, Step 1
    - Risk: High
 
+3. **Enhance Concurrency & Thread Safety** (File: `app/database.py` & `app/scheduler.py`)
+   - Action: Enable SQLite WAL mode via SQLAlchemy pragmas. Enforce strict `SessionLocal` connection pooling in FastMCP route handlers and ensure `GLOBAL_JOB_QUEUE` strictly segregates watcher DB reads from worker DB writes.
+   - Why: Prevents `database is locked` race conditions when the Claude Desktop UI thread and background threads access the DB simultaneously.
+   - Dependencies: None
+   - Risk: Low
+
 ### Phase 3: LLM Pre-Parsing Middleware
-1. **Implement NLP Parser Tool** (File: `app/llm_parser.py`)
+1. **Implement Worker LLM Execution** (File: `app/scheduler.py`)
+   - Action: Update `worker_loop` to instantiate an Gemini client. When executing a job, use the API to process `job.description`, capture the output, and save it to `job.result` in the DB.
+   - Why: The background worker thread must act as its own client to execute tasks independently.
+   - Dependencies: None
+   - Risk: Medium
+
+2. **Implement NLP Parser Tool** (File: `app/llm_parser.py`)
    - Action: Create a function that takes a natural language string, calls an LLM API, and uses structured outputs to return a validated Pydantic `TaskSchema` (description, scheduled_at, cron_expr, dependencies).
    - Why: Pre-parses raw user requests into strict parameters before hitting `task_create`.
    - Dependencies: None
    - Risk: Medium
 
-2. **Integrate Middleware into MCP** (File: `app/mcp_server.py`)
+3. **Integrate Middleware into MCP** (File: `app/mcp_server.py`)
    - Action: Create a new tool `@mcp.tool() def nlp_task_create(query: str)` which calls the `llm_parser`, then internally calls the standard `task_create` logic.
    - Why: Exposes the NLP capability to the MCP client cleanly.
    - Dependencies: Phase 3, Step 1
@@ -77,13 +91,19 @@ This plan outlines the upgrade of the existing local `stdio`-based MCP task sche
    - Dependencies: Phase 1, Step 1
    - Risk: Low
 
+3. **(Optional) Implement Proactive Result Notifications** (File: `app/scheduler.py` & `app/mcp_server.py`)
+   - Action: Utilize MCP's Server-to-Client mechanisms (e.g., experimental MCP Sampling, Logging notifications, or Server-Sent Events) triggered directly from the `worker_loop`.
+   - Why: To ensure users automatically receive the result in the chat immediately when a job is completed, eliminating the need to proactively ask.
+   - Dependencies: Phase 2, Step 3
+   - Risk: High (Server-initiated messages in standard chat clients rely on experimental or UI-dependent capabilities).
+
 ## Testing Strategy
 - Unit tests: `tests/test_scheduler.py` (validate cron timing and DAG dependency resolution), `tests/test_llm_parser.py` (mock LLM API to test structured schema extraction).
 - [MCP Inspector](https://github.com/modelcontextprotocol/inspector): run with `npx @modelcontextprotocol/inspector uv run python -m app.mcp_server` to test MCP server.
 - Integration tests: `tests/test_mcp_server.py` (simulate FastMCP tool calls, resource fetching, and prompt generation via TestClient).
 
 ## Risks & Mitigations
-- **Risk**: SQLite concurrency issues with multiple HTTP requests (SSE) and background threads. -> Mitigation: Continue using `check_same_thread=False` but ensure tight, short-lived sessions and consider WAL mode for SQLite.
+- **Risk**: SQLite concurrency issues and race conditions between the FastMCP stdio process and background threads. -> Mitigation: Enforce short-lived `SessionLocal` contexts, maintain `check_same_thread=False`, enable WAL (Write-Ahead Logging) mode, and rely on the thread-safe `GLOBAL_JOB_QUEUE` to segregate reads/writes.
 - **Risk**: LLM pre-parsing API failures or latency. -> Mitigation: Implement robust error handling, retries, and fallback to direct programmatic `task_create` if the NLP middleware fails.
 - **Risk**: Complex DAG cyclical dependencies. -> Mitigation: Implement a topological sort/cycle detection check during DAG job creation.
 
@@ -91,6 +111,8 @@ This plan outlines the upgrade of the existing local `stdio`-based MCP task sche
 - [ ] FastMCP is the active framework serving tools, resources, and prompts over SSE/stdio.
 - [ ] Jobs can be scheduled with cron expressions and correctly recur.
 - [ ] Job B only executes when its parent Job A successfully completes.
+- [ ] `worker_loop` successfully calls the Gemini API to execute tasks independently and stores the result.
+- [ ] (Optional) Completed job results are pushed automatically to the user's chat interface.
 - [ ] `nlp_task_create` successfully uses an LLM to convert "Remind me to call John every Tuesday" into a structured cron job.
 - [ ] `job://{job_id}/logs` successfully returns live job text.
 - [ ] `daily_review` prompt successfully formats DB data.
