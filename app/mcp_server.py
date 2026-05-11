@@ -5,7 +5,7 @@ from fastmcp import FastMCP
 
 from app.database import Base, SessionLocal, engine
 from app.models import Job
-from app.scheduler import get_time_bucket, start_scheduler
+from app.scheduler import get_time_bucket, start_scheduler, enqueued_job_ids
 
 import os
 
@@ -56,10 +56,15 @@ def task_status(job_id: int) -> dict:
         job = db.query(Job).filter(Job.id == job_id).first()
         if job is None:
             return {"error": f"Job {job_id} not found"}
+            
+        current_status = job.status
+        if current_status == "pending" and job.id in enqueued_job_ids:
+            current_status = "queued"
+            
         return {
             "job_id": job.id,
             "description": job.description,
-            "status": job.status,
+            "status": current_status,
             "scheduled_at": str(job.scheduled_at),
             "cron_expr": job.cron_expr,
             "parent_job_id": job.parent_job_id,
@@ -76,7 +81,7 @@ def task_list() -> dict:
                 {
                     "job_id": j.id,
                     "description": j.description,
-                    "status": j.status,
+                    "status": "queued" if j.status == "pending" and j.id in enqueued_job_ids else j.status,
                     "scheduled_at": str(j.scheduled_at),
                     "cron_expr": j.cron_expr,
                     "parent_job_id": j.parent_job_id

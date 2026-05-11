@@ -13,6 +13,26 @@ from app.models import Job, _utcnow
 # In-memory, thread-safe, global job queue (simulates SQS for prototype)
 GLOBAL_JOB_QUEUE: queue.Queue[int] = queue.Queue()
 
+class ThreadSafeSet:
+    """A thread-safe wrapper around a Python set to prevent race conditions independent of the GIL."""
+    def __init__(self):
+        self._set = set()
+        self._lock = threading.Lock()
+
+    def add(self, item: int):
+        with self._lock:
+            self._set.add(item)
+
+    def discard(self, item: int):
+        with self._lock:
+            self._set.discard(item)
+
+    def __contains__(self, item: int) -> bool:
+        with self._lock:
+            return item in self._set
+
+enqueued_job_ids = ThreadSafeSet()
+
 
 def get_time_bucket(scheduled_at: datetime) -> str:
     """Convert scheduled time to time bucket — used as DB partition key.
@@ -68,16 +88,17 @@ def find_due_jobs(current_time: datetime, db: Session) -> list[Job]:
 def watcher_loop(interval: int = 10):
     """Watcher scans DB for due jobs and pushes them to the queue."""
     while True:
-        db = SessionLocal()
         try:
-            now = _utcnow()
-            due_jobs = find_due_jobs(now, db)
-            for job in due_jobs:
-                job.status = "queued"
-                db.commit()
-                GLOBAL_JOB_QUEUE.put(job.id)
-        finally:
-            db.close()
+            with SessionLocal() as db:
+                now = _utcnow()
+                due_jobs = find_due_jobs(now, db)
+                for job in due_jobs:
+                    if job.id not in enqueued_job_ids:
+                        enqueued_job_ids.add(job.id)
+                        GLOBAL_JOB_QUEUE.put(job.id)
+        except Exception as e:
+            # Keep watcher alive if DB encounters a transient error
+            pass
         time.sleep(interval)
 
 
@@ -87,43 +108,45 @@ def worker_loop():
     """Worker pulls jobs from queue and executes them."""
     while True:
         job_id = GLOBAL_JOB_QUEUE.get()
-        db = SessionLocal()
         try:
-            job = db.query(Job).filter(Job.id == job_id).first()
-            if job is None or job.status == "cancelled":
-                continue
+            with SessionLocal() as db:
+                job = db.query(Job).filter(Job.id == job_id).first()
+                if job is None or job.status == "cancelled":
+                    continue
 
-            job.status = "running"
-            db.commit()
-
-            # Simulate execution — in production this would call LLM
-            job.result = f"Executed: {job.description}"
-            job.status = "completed"
-
-            # Check if job is recurring
-            if job.cron_expr:
-                try:
-                    next_time = croniter(job.cron_expr, job.scheduled_at).get_next(datetime)
-                    new_job = Job(
-                        description=job.description,
-                        scheduled_at=next_time,
-                        time_bucket=get_time_bucket(next_time),
-                        cron_expr=job.cron_expr,
-                        parent_job_id=job.parent_job_id
-                    )
-                    db.add(new_job)
-                except Exception as cron_err:
-                    job.logs = f"Cron scheduling failed: {cron_err}"
-
-            db.commit()
-        except Exception as e:
-            if 'job' in locals() and job:
-                job.status = "failed"
-                job.result = str(e)
-                job.logs = str(e)
+                job.status = "running"
                 db.commit()
+
+                # Simulate execution — in production this would call LLM
+                job.result = f"Executed: {job.description}"
+                job.status = "completed"
+
+                # Check if job is recurring
+                if job.cron_expr:
+                    try:
+                        next_time = croniter(job.cron_expr, job.scheduled_at).get_next(datetime)
+                        new_job = Job(
+                            description=job.description,
+                            scheduled_at=next_time,
+                            time_bucket=get_time_bucket(next_time),
+                            cron_expr=job.cron_expr,
+                            parent_job_id=job.parent_job_id
+                        )
+                        db.add(new_job)
+                    except Exception as cron_err:
+                        job.logs = f"Cron scheduling failed: {cron_err}"
+
+                db.commit()
+        except Exception as e:
+            with SessionLocal() as db:
+                job = db.query(Job).filter(Job.id == job_id).first()
+                if job:
+                    job.status = "failed"
+                    job.result = str(e)
+                    job.logs = str(e)
+                    db.commit()
         finally:
-            db.close()
+            enqueued_job_ids.discard(job_id)
             GLOBAL_JOB_QUEUE.task_done()
 
 
