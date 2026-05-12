@@ -1,14 +1,27 @@
+import concurrent.futures
+import logging
+import os
 import queue
 import threading
 import time
 from datetime import datetime
 
+from dotenv import load_dotenv
+from google import genai
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy import select
 from croniter import croniter
 
 from app.database import SessionLocal
 from app.models import Job, _utcnow
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+GEMINI_API_KEY_VAR = "GEMINI_API_KEY"
+GEMINI_MODEL = "gemini-2.5-flash"
+LLM_TIMEOUT_SECONDS = 60
 
 # In-memory, thread-safe, global job queue (simulates SQS for prototype)
 GLOBAL_JOB_QUEUE: queue.Queue[int] = queue.Queue()
@@ -97,62 +110,178 @@ def watcher_loop(interval: int = 10):
                         enqueued_job_ids.add(job.id)
                         GLOBAL_JOB_QUEUE.put(job.id)
         except Exception as e:
-            # Keep watcher alive if DB encounters a transient error
-            pass
+            logger.error("Watcher loop error: %s", e, exc_info=True)
         time.sleep(interval)
+
+
+def _get_gemini_client_sync() -> genai.Client | None:
+    """Create a synchronous Gemini client from the environment API key.
+
+    Returns None if the API key is not configured, allowing the worker
+    to fall back to a no-op execution mode.
+    """
+    api_key = os.environ.get(GEMINI_API_KEY_VAR)
+    if not api_key:
+        logger.warning(
+            "GEMINI_API_KEY not set — worker will use placeholder execution."
+        )
+        return None
+    return genai.Client(api_key=api_key)
+
+
+def _execute_with_llm(client: genai.Client, description: str) -> str:
+    """Send a job description to the Gemini API and return the response.
+
+    Uses a ThreadPoolExecutor to enforce LLM_TIMEOUT_SECONDS, preventing
+    a hung Gemini call from permanently blocking the worker thread.
+
+    Args:
+        client: An initialized Gemini client.
+        description: The job description to process.
+
+    Returns:
+        The LLM's text response.
+
+    Raises:
+        TimeoutError: If the Gemini API call exceeds LLM_TIMEOUT_SECONDS.
+        Exception: Propagated from the Gemini SDK on API failures.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=f"Execute the following task and provide the result:\n\n{description}",
+            config=genai.types.GenerateContentConfig(
+                temperature=0.3,
+            ),
+        )
+        try:
+            response = future.result(timeout=LLM_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(
+                f"Gemini API call timed out after {LLM_TIMEOUT_SECONDS}s"
+            ) from None
+    return response.text
 
 
 # scale out with this pattern, does it solve starvation when worker scale out ? 
 # do we still need order_by at DB level? or reaper pattern ?
 def worker_loop():
-    """Worker pulls jobs from queue and executes them."""
+    """Worker pulls jobs from queue and executes them via Gemini LLM.
+
+    The DB session is split into two short-lived transactions:
+    1. Transaction 1: Read job details + mark 'running' (fast)
+    2. LLM call runs OUTSIDE any DB session (pool connection released)
+    3. Transaction 2: Write result + mark 'completed' (fast)
+
+    This prevents QueuePool exhaustion when LLM calls take 5-60+ seconds.
+    """
+    gemini_client = _get_gemini_client_sync()
+
     while True:
         job_id = GLOBAL_JOB_QUEUE.get()
+        description = None
+        cron_expr = None
+        scheduled_at = None
+        parent_job_id = None
+
+        # Transaction 1: Fast read + mark running
         try:
             with SessionLocal() as db:
                 job = db.query(Job).filter(Job.id == job_id).first()
                 if job is None or job.status == "cancelled":
+                    enqueued_job_ids.discard(job_id)
+                    GLOBAL_JOB_QUEUE.task_done()
                     continue
 
+                description = job.description
+                cron_expr = job.cron_expr
+                scheduled_at = job.scheduled_at
+                parent_job_id = job.parent_job_id
                 job.status = "running"
                 db.commit()
+        except Exception as e:
+            logger.error("Failed to start job %d: %s", job_id, e)
+            enqueued_job_ids.discard(job_id)
+            GLOBAL_JOB_QUEUE.task_done()
+            continue
 
-                # Simulate execution — in production this would call LLM
-                job.result = f"Executed: {job.description}"
+        # LLM call runs OUTSIDE any DB session — pool connection is fully released
+        result_text = f"Executed (no LLM): {description}"
+        llm_log = None
+        if gemini_client is not None:
+            try:
+                result_text = _execute_with_llm(gemini_client, description)
+                logger.info("Job %d executed via LLM successfully.", job_id)
+            except Exception as llm_err:
+                logger.error(
+                    "LLM execution failed for job %d: %s", job_id, llm_err
+                )
+                result_text = f"LLM error: {llm_err}"
+                llm_log = f"LLM error: {llm_err}"
+
+        # Transaction 2: Fast write of result
+        try:
+            with SessionLocal() as db:
+                job = db.query(Job).filter(Job.id == job_id).first()
+                if job is None:
+                    logger.error("Job %d disappeared between transactions.", job_id)
+                    continue
+
+                job.result = result_text
                 job.status = "completed"
+                if llm_log:
+                    job.logs = (job.logs or "") + f"\n{llm_log}"
 
                 # Check if job is recurring
-                if job.cron_expr:
+                if cron_expr and scheduled_at:
                     try:
-                        next_time = croniter(job.cron_expr, job.scheduled_at).get_next(datetime)
+                        next_time = croniter(cron_expr, scheduled_at).get_next(datetime)
                         new_job = Job(
-                            description=job.description,
+                            description=description,
                             scheduled_at=next_time,
                             time_bucket=get_time_bucket(next_time),
-                            cron_expr=job.cron_expr,
-                            parent_job_id=job.parent_job_id
+                            cron_expr=cron_expr,
+                            parent_job_id=parent_job_id,
                         )
                         db.add(new_job)
                     except Exception as cron_err:
-                        job.logs = f"Cron scheduling failed: {cron_err}"
+                        job.logs = (job.logs or "") + f"\nCron scheduling failed: {cron_err}"
 
                 db.commit()
         except Exception as e:
-            with SessionLocal() as db:
-                job = db.query(Job).filter(Job.id == job_id).first()
-                if job:
-                    job.status = "failed"
-                    job.result = str(e)
-                    job.logs = str(e)
-                    db.commit()
+            logger.error("Worker error writing result for job %d: %s", job_id, e)
+            try:
+                with SessionLocal() as db:
+                    job = db.query(Job).filter(Job.id == job_id).first()
+                    if job:
+                        job.status = "failed"
+                        job.result = str(e)
+                        job.logs = str(e)
+                        db.commit()
+            except Exception:
+                logger.error(
+                    "Failed to mark job %d as failed — will require Reaper.",
+                    job_id,
+                    exc_info=True,
+                )
         finally:
             enqueued_job_ids.discard(job_id)
             GLOBAL_JOB_QUEUE.task_done()
 
 
-def start_scheduler():
-    """Start watcher and worker threads."""
+DEFAULT_NUM_WORKERS = 1
+
+
+def start_scheduler(num_workers: int = DEFAULT_NUM_WORKERS):
+    """Start watcher and worker threads.
+
+    Args:
+        num_workers: Number of worker threads to spawn for parallel LLM execution.
+    """
     watcher = threading.Thread(target=watcher_loop, daemon=True)
-    worker = threading.Thread(target=worker_loop, daemon=True)
     watcher.start()
-    worker.start()
+    for i in range(num_workers):
+        worker = threading.Thread(target=worker_loop, daemon=True, name=f"worker-{i}")
+        worker.start()
+    logger.info("Scheduler started: 1 watcher, %d worker(s).", num_workers)

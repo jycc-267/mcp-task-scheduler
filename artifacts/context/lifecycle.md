@@ -95,3 +95,43 @@ To ensure transactions remain as short and non-blocking as possible, database re
 - **The "Virtual State" UX Pattern:** Although jobs are no longer physically updated to `"queued"` in the database (to avoid blocking the UI thread with write-locks), retaining this state provides critical user feedback indicating a task is actively waiting for an available worker. To achieve this, the system uses a "Virtual State" pattern: FastMCP API endpoints (`task_status`, `task_list`) dynamically intercept the database response. If a job is strictly `"pending"` on disk but its ID concurrently exists in the `enqueued_job_ids` set, the API intercepts and returns `"queued"` to the UI. This delivers the rich UX of a queue status without the severe performance penalty of an actual database write!
 - **Worker-Owned State Transitions:** The worker thread exclusively performs database mutations. It fully owns all state transitions (`"running"`, `"completed"`, `"failed"`) once a job is removed from the queue.
 - **Uniform Context Management:** Both the `watcher_loop`, `worker_loop`, and FastMCP route handlers uniformly handle their database connections using the `with SessionLocal() as db:` context manager. This rigorously scopes transactions, ensuring connections are rapidly checked out and cleanly returned to the `QueuePool` the instant a query finishes.
+
+
+## 5. Design Decision: Why We Don't Use MCP Sampling
+
+### What MCP Sampling Is
+
+MCP Sampling (`sampling/createMessage`) is a protocol feature that lets the **MCP server ask the connected MCP client** (e.g., Claude Desktop) to run an LLM inference on its behalf and return the result. The server delegates the generation request back through the client, borrowing the client's model without needing its own API key.
+
+### Why It Is Incompatible with This Architecture
+
+#### ❌ The Background Worker — Fundamentally Incompatible
+
+The `worker_loop` is a daemon thread that executes jobs **autonomously and independently** — potentially while the user is away or has Claude Desktop closed. MCP sampling is a synchronous request-response routed back to the *currently connected* client. If the client is not present, the request has nowhere to go.
+
+This is the defining constraint of the Proactive Worker pattern described in §3:
+> *"The chat interface is merely a window to view the database; the heavy lifting is completely localized to the proactive Python background threads."*
+
+Making the worker depend on MCP sampling would destroy autonomous execution — the scheduler would only be able to run jobs while the user was actively using Claude Desktop. The direct Gemini API call in `worker_loop` (via `_execute_with_llm`) is therefore the **correct and only viable pattern** for unattended background execution.
+
+#### ❌ The NLP Parser (`nlp_task_create`) — Works Technically, But Loses Structured Output
+
+`nlp_task_create` is an MCP tool invoked while the client *is* connected, so sampling would technically function here. However, the current implementation relies on Gemini's **structured output** feature (`response_mime_type="application/json"`, `response_schema=TaskSchema`) to guarantee that `model_validate_json` always receives a well-formed response. MCP sampling returns free-form text from the client's model — losing this guarantee and re-introducing the parsing fragility that Pydantic was designed to eliminate.
+
+| | Current (Direct Gemini API) | MCP Sampling |
+|---|---|---|
+| **Structured JSON output** | ✅ Enforced via `response_schema=TaskSchema` | ❌ Free-form text, manual parsing required |
+| **Client must be active** | ✅ No — worker runs unattended | ❌ Yes — requires live client connection |
+| **API key required** | Yes (`GEMINI_API_KEY`) | No (borrows client model) |
+| **Model control** | ✅ Pinned to `gemini-2.0-flash` | ❌ Depends on whatever client model is active |
+
+### When MCP Sampling Would Make Sense
+
+MCP sampling is the right choice when:
+- The server has **no API key** and needs to piggyback on the client's model.
+- The workflow requires **human-in-the-loop approval** of LLM outputs before acting.
+- The server needs access to **conversation history and context** held by the client.
+
+None of these conditions apply here. This project owns a `GEMINI_API_KEY`, its defining value proposition is autonomous background execution without a connected client, and the NLP parser achieves higher reliability through Gemini's native structured output than through free-form sampling from an unknown client model.
+
+**Verdict:** Direct Gemini API calls are the correct architectural choice for both the background worker and the NLP parser in this system.

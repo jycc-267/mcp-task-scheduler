@@ -1,13 +1,18 @@
 import argparse
+import logging
+import os
 from datetime import datetime
 
+from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 from app.database import Base, SessionLocal, engine
 from app.models import Job
 from app.scheduler import get_time_bucket, start_scheduler, enqueued_job_ids
 
-import os
+load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # ===================================================================
 # MCP server wiring
@@ -72,10 +77,21 @@ def task_status(job_id: int) -> dict:
         }
 
 @mcp.tool()
-def task_list() -> dict:
-    """List all scheduled tasks."""
+def task_list(limit: int = 100, offset: int = 0) -> dict:
+    """List scheduled tasks with pagination.
+
+    Args:
+        limit: Maximum number of tasks to return (default 100)
+        offset: Number of tasks to skip for pagination (default 0)
+    """
     with SessionLocal() as db:
-        jobs = db.query(Job).order_by(Job.scheduled_at.desc()).all()
+        jobs = (
+            db.query(Job)
+            .order_by(Job.scheduled_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
         return {
             "jobs": [
                 {
@@ -106,6 +122,43 @@ def task_cancel(job_id: int) -> dict:
         job.status = "cancelled"
         db.commit()
         return {"job_id": job.id, "status": "cancelled"}
+
+@mcp.tool()
+async def nlp_task_create(query: str) -> dict:
+    """Create a task from a natural language description using LLM parsing.
+
+    Takes a free-form text query (e.g., "Summarize the news every Friday at 5pm")
+    and uses an LLM to extract structured scheduling parameters, then creates
+    the task automatically.
+
+    Args:
+        query: Natural language description of the task to schedule
+    """
+    from app.llm_parser import parse_task
+
+    try:
+        schema = await parse_task(query)
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"LLM parsing failed: {e}"}
+
+    parent_job_id = None
+    if schema.dependencies:
+        if len(schema.dependencies) > 1:
+            logger.warning(
+                "nlp_task_create: %d dependencies returned, only first will be used: %s",
+                len(schema.dependencies),
+                schema.dependencies,
+            )
+        parent_job_id = schema.dependencies[0]
+
+    return task_create(
+        description=schema.description,
+        scheduled_at=schema.scheduled_at,
+        cron_expr=schema.cron_expr,
+        parent_job_id=parent_job_id,
+    )
 
 # ===================================================================
 # Entry point
