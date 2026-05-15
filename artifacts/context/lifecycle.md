@@ -75,6 +75,7 @@ The system runs multiple threads simultaneously:
 1. **The FastMCP Stdio Process (Main Thread):** Executing immediate tool calls from Claude Desktop (e.g., writing new jobs via `task_create`).
 2. **The Watcher Thread:** Polling the database continuously to find due jobs.
 3. **The Worker Thread:** Reading job details, executing LLM calls, and writing `results` back to the database.
+4. **The Reaper Thread:** Periodically scanning for jobs stuck in `"running"` and recovering them.
 
 When Claude Desktop schedules a task at the exact same millisecond the watcher thread polls the database or the worker thread updates a result, a **Race Condition** can occur. If not handled correctly, this can lead to database locking errors (`OperationalError: database is locked`), missed jobs, or data corruption.
 
@@ -95,6 +96,47 @@ To ensure transactions remain as short and non-blocking as possible, database re
 - **The "Virtual State" UX Pattern:** Although jobs are no longer physically updated to `"queued"` in the database (to avoid blocking the UI thread with write-locks), retaining this state provides critical user feedback indicating a task is actively waiting for an available worker. To achieve this, the system uses a "Virtual State" pattern: FastMCP API endpoints (`task_status`, `task_list`) dynamically intercept the database response. If a job is strictly `"pending"` on disk but its ID concurrently exists in the `enqueued_job_ids` set, the API intercepts and returns `"queued"` to the UI. This delivers the rich UX of a queue status without the severe performance penalty of an actual database write!
 - **Worker-Owned State Transitions:** The worker thread exclusively performs database mutations. It fully owns all state transitions (`"running"`, `"completed"`, `"failed"`) once a job is removed from the queue.
 - **Uniform Context Management:** Both the `watcher_loop`, `worker_loop`, and FastMCP route handlers uniformly handle their database connections using the `with SessionLocal() as db:` context manager. This rigorously scopes transactions, ensuring connections are rapidly checked out and cleanly returned to the `QueuePool` the instant a query finishes.
+
+#### 3. Split-Transaction Worker & QueuePool Protection
+The worker executes a job across **two deliberately separate, short-lived DB transactions** with the Gemini LLM call running between them — completely outside any open session.
+
+```
+Transaction 1 (fast):  Read job → mark "running" → commit → release connection
+      ↓
+LLM Call (5–60s):       _execute_with_llm() — NO DB session held
+      ↓
+Transaction 2 (fast):  Write result → mark "completed" → commit → release connection
+```
+
+**Why this matters:** If the worker held a single open `SessionLocal()` session across the entire LLM call, each in-flight job would hold one `QueuePool` connection for 5–60+ seconds. With `pool_size=5, max_overflow=10`, just 15 concurrent jobs would exhaust the pool entirely, blocking the MCP UI thread and the Watcher. By releasing the connection between the two transactions, the pool is fully available to all other threads during the long API round-trip.
+
+**LLM Timeout Enforcement:** `_execute_with_llm` wraps the blocking `generate_content` call in a `concurrent.futures.ThreadPoolExecutor` with `future.result(timeout=LLM_TIMEOUT_SECONDS)`. A hung Gemini call raises `TimeoutError` after 60 seconds rather than blocking the worker thread forever.
+
+#### 4. Visibility Reset & the Reaper Pattern
+
+`enqueued_job_ids` is conceptually equivalent to **SQS's Visibility Timeout**: once the Watcher adds a job ID to the set, the job becomes "invisible" to future Watcher polls — preventing double-dispatching. `enqueued_job_ids.discard(job_id)` is the act of "returning the message to the queue" or "deleting the message after success."
+
+**Visibility Reset (Transient Failures):** If the worker's Transaction 2 fails (e.g., a DB write error), the error handler:
+1. Resets `job.status` from `"running"` back to `"pending"` in the database.
+2. Calls `enqueued_job_ids.discard(job_id)` in the `finally` block.
+
+With both conditions cleared, the Watcher will rediscover and re-enqueue the job on its next poll cycle — providing automatic retry without manual intervention.
+
+**Idempotency Guard (Transaction 1):** The worker checks `if job.status != "pending"` rather than just `if job.status == "cancelled"`. This is a critical defensive guard — the database is the ultimate source of truth. By requiring the job to be exactly `"pending"`, the worker rejects any job that was already picked up by another worker, completed, failed, or cancelled between the time it was enqueued and the time a worker thread dequeued it. This makes the worker provably idempotent.
+
+**Cancellation Race Condition (Transaction 2):** If the user cancels a job via `task_cancel` *during* the 5–60 second LLM call, the worker detects `job.status == "cancelled"` in Transaction 2 and discards the result rather than overwriting the cancellation with `"completed"`.
+
+**The Reaper Thread (Crash Recovery):** `reaper_loop` runs every 5 minutes as a daemon thread and targets jobs that have been stuck in `"running"` for more than 5 minutes — the sign of a crashed or hung worker thread. The Reaper uses an **atomic bulk update** to prevent a race condition:
+
+```python
+# Atomic: re-checks status == "running" inside the UPDATE — safe even if a worker
+# completes the job between the SELECT and the UPDATE.
+db.query(Job)
+  .filter(Job.id.in_(stuck_ids), Job.status == "running")
+  .update({"status": "pending"}, synchronize_session=False)
+```
+
+This is safer than iterating and setting each `job.status = "pending"` individually, because the `WHERE status = 'running'` clause in the `UPDATE` prevents the Reaper from overwriting a `"completed"` status that a worker just wrote in the narrow window between the initial `SELECT` and the `UPDATE`.
 
 
 ## 5. Design Decision: Why We Don't Use MCP Sampling
