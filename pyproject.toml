@@ -9,6 +9,7 @@ dependencies = [
     "fastmcp>=3.2.4",
     "google-genai>=2.0.1",
     "mcp>=1.0.0",
+    "psycopg2-binary>=2.9.12",
     "python-dotenv>=1.2.2",
     "sqlalchemy==2.0.36",
 ]
