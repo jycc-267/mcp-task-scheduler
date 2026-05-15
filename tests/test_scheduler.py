@@ -23,9 +23,8 @@ TestSessionLocal = sessionmaker(bind=test_engine)
 def setup_database():
     Base.metadata.create_all(bind=test_engine)
     
-    # Patch SessionLocal in all modules to prevent any test from reaching Supabase
-    with patch("app.scheduler.SessionLocal", new=TestSessionLocal), \
-         patch("app.mcp_server.SessionLocal", new=TestSessionLocal):
+    # Patch the SessionLocal used by the scheduler functions if needed
+    with patch("app.scheduler.SessionLocal", new=TestSessionLocal):
         db = TestSessionLocal()
         yield db
         db.close()

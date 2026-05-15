@@ -24,9 +24,7 @@ TestSessionLocal = sessionmaker(bind=test_engine)
 def setup_test_db():
     """Create a fresh in-memory schema for every test, then tear it down."""
     Base.metadata.create_all(bind=test_engine)
-    # Patch SessionLocal in all modules to prevent any test from reaching Supabase
-    with patch("app.scheduler.SessionLocal", new=TestSessionLocal), \
-         patch("app.mcp_server.SessionLocal", new=TestSessionLocal):
+    with patch("app.scheduler.SessionLocal", new=TestSessionLocal):
         yield
     Base.metadata.drop_all(bind=test_engine)
 

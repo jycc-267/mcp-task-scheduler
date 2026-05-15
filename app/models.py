@@ -33,9 +33,9 @@ class Job(Base):
         # 只有 pending 的任務會進入索引，優化故障恢復時的範圍查詢 (<=)
         Index(
             "idx_pending_scheduler",
-            "time_bucket",
+            "time_bucket", 
             "scheduled_at",
-            postgresql_where=text("status = 'pending'"),  # 一旦任務被queued，它就會從索引中被剔除。
+            sqlite_where=text("status = 'pending'")  # 一旦任務被queued，它就會從索引中被剔除。
         ),
         Index("idx_bucket_status", "time_bucket", "status"),
     )

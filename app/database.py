@@ -1,42 +1,27 @@
-import logging
-import os
-
-from dotenv import load_dotenv
-from sqlalchemy import create_engine
+import sqlite3
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import QueuePool
 
-load_dotenv()
+DATABASE_URL = "sqlite:///./chatgpt_task.db"
 
-logger = logging.getLogger(__name__)
-
-from urllib.parse import quote_plus
-
-_DB_USER = quote_plus(os.environ["DB_USER"])
-_DB_PASSWORD = quote_plus(os.environ["DB_PASSWORD"])
-_DB_HOST = os.environ["DB_HOST"]
-_DB_PORT = os.environ["DB_PORT"]
-_DB_NAME = quote_plus(os.environ["DB_NAME"])
-
-DATABASE_URL = (
-    f"postgresql+psycopg2://{_DB_USER}:{_DB_PASSWORD}"
-    f"@{_DB_HOST}:{_DB_PORT}/{_DB_NAME}?sslmode=require"
-)
-
+# Enforce strict connection pooling to handle concurrent DB access
 engine = create_engine(
     DATABASE_URL,
-    poolclass=NullPool,   # No persistent pool: each thread opens/closes its own connection
-    echo=False,
+    connect_args={"check_same_thread": False, "timeout": 15},
+    poolclass=QueuePool,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30,
 )
 
-# Optional: Add a simple check to ensure the engine can connect
-try:
-    with engine.connect() as connection:
-        logger.info("Successfully connected to the database.")
-except Exception as e:
-    logger.error(f"Database connection failed: {e}")
-    # We don't raise here to allow the app to potentially start, 
-    # but the error will be visible in the logs.
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    if isinstance(dbapi_connection, sqlite3.Connection):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
 
 SessionLocal = sessionmaker(bind=engine)
 
