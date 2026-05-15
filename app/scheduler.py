@@ -4,7 +4,7 @@ import os
 import queue
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from google import genai
@@ -44,6 +44,7 @@ class ThreadSafeSet:
         with self._lock:
             return item in self._set
 
+# Mimic SQS's visibility timeout, preventing duplicate job processing.
 enqueued_job_ids = ThreadSafeSet()
 
 
@@ -114,6 +115,45 @@ def watcher_loop(interval: int = 10):
         time.sleep(interval)
 
 
+def reaper_loop(interval: int = 300):
+    """The Reaper ensures 'Visibility Timeout' by recovering stuck jobs.
+
+    If a worker crashes or a thread dies, jobs might stay in 'running'
+    for too long. The Reaper finds jobs that have been 'running'
+    for more than 5 minutes and resets them to 'pending'.
+    """
+    while True:
+        try:
+            with SessionLocal() as db:
+                stuck_threshold = _utcnow() - timedelta(minutes=5)
+                stuck_jobs = (
+                    db.query(Job.id)
+                    .filter(Job.status == "running")
+                    .filter(Job.updated_at < stuck_threshold)
+                    .all()
+                )
+                if stuck_jobs:
+                    stuck_ids = [j[0] for j in stuck_jobs]
+                    # Atomic update: prevents race condition where a worker completes the job 
+                    # right after the Reaper queries it.
+                    updated_count = (
+                        db.query(Job)
+                        .filter(Job.id.in_(stuck_ids), Job.status == "running")
+                        .update({"status": "pending"}, synchronize_session=False)
+                    )
+                    db.commit()
+                    if updated_count > 0:
+                        for j_id in stuck_ids:
+                            logger.warning(
+                                "Reaper recovering stuck job %d (resetting to pending)", j_id
+                            )
+                            # Ensure ID is removed from virtual set so Watcher can re-enqueue
+                            enqueued_job_ids.discard(j_id)
+        except Exception as e:
+            logger.error("Reaper error: %s", e)
+        time.sleep(interval)
+
+
 def _get_gemini_client_sync() -> genai.Client | None:
     """Create a synchronous Gemini client from the environment API key.
 
@@ -179,7 +219,7 @@ def worker_loop():
     gemini_client = _get_gemini_client_sync()
 
     while True:
-        job_id = GLOBAL_JOB_QUEUE.get()
+        job_id = GLOBAL_JOB_QUEUE.get() # should we persist failed job_id in the queue?
         description = None
         cron_expr = None
         scheduled_at = None
@@ -189,7 +229,7 @@ def worker_loop():
         try:
             with SessionLocal() as db:
                 job = db.query(Job).filter(Job.id == job_id).first()
-                if job is None or job.status == "cancelled":
+                if job is None or job.status != "pending":
                     enqueued_job_ids.discard(job_id)
                     GLOBAL_JOB_QUEUE.task_done()
                     continue
@@ -228,6 +268,11 @@ def worker_loop():
                     logger.error("Job %d disappeared between transactions.", job_id)
                     continue
 
+                # Check if job was cancelled by UI during the long LLM call
+                if job.status == "cancelled":
+                    logger.info("Job %d was cancelled during execution. Discarding result.", job_id)
+                    continue
+
                 job.result = result_text
                 job.status = "completed"
                 if llm_log:
@@ -254,14 +299,17 @@ def worker_loop():
             try:
                 with SessionLocal() as db:
                     job = db.query(Job).filter(Job.id == job_id).first()
-                    if job:
-                        job.status = "failed"
-                        job.result = str(e)
-                        job.logs = str(e)
+                    # Only reset to pending if it wasn't cancelled by the user
+                    if job and job.status == "running":
+                        # Visibility Reset: return to pending so Watcher can retry
+                        # after enqueued_job_ids.discard() in finally block
+                        job.status = "pending"
+                        job.logs = (job.logs or "") + f"\nTransient worker error: {e}"
                         db.commit()
+                        logger.info("Job %d reset to 'pending' for retry.", job_id)
             except Exception:
                 logger.error(
-                    "Failed to mark job %d as failed — will require Reaper.",
+                    "Failed to reset job %d to 'pending' — will require Reaper.",
                     job_id,
                     exc_info=True,
                 )
@@ -274,14 +322,16 @@ DEFAULT_NUM_WORKERS = 1
 
 
 def start_scheduler(num_workers: int = DEFAULT_NUM_WORKERS):
-    """Start watcher and worker threads.
+    """Start watcher, worker, and reaper threads.
 
     Args:
         num_workers: Number of worker threads to spawn for parallel LLM execution.
     """
-    watcher = threading.Thread(target=watcher_loop, daemon=True)
+    watcher = threading.Thread(target=watcher_loop, daemon=True, name="watcher")
+    reaper = threading.Thread(target=reaper_loop, daemon=True, name="reaper")
     watcher.start()
+    reaper.start()
     for i in range(num_workers):
         worker = threading.Thread(target=worker_loop, daemon=True, name=f"worker-{i}")
         worker.start()
-    logger.info("Scheduler started: 1 watcher, %d worker(s).", num_workers)
+    logger.info("Scheduler started: 1 watcher, 1 reaper, %d worker(s).", num_workers)

@@ -9,6 +9,7 @@ wheels/
 
 .DS_Store
 .env
+connection_tests/
 
 # Virtual environments
 .venv/
