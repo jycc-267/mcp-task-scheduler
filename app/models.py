@@ -1,9 +1,9 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Index, Integer, String, Text, text
+from sqlalchemy import DateTime, Index, Integer, String, Text, text, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .database import Base
+from app.database import Base
 
 
 def _utcnow() -> datetime:
@@ -20,6 +20,9 @@ class Job(Base):
     scheduled_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending, queued, running, completed, failed, cancelled
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cron_expr: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    parent_job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
+    logs: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utcnow, onupdate=_utcnow

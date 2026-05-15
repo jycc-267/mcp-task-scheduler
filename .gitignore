@@ -8,6 +8,8 @@ wheels/
 *.ipynb_checkpoints
 
 .DS_Store
+.env
+connection_tests/
 
 # Virtual environments
 .venv/
