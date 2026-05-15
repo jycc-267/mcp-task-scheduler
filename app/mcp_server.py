@@ -1,10 +1,18 @@
 import argparse
 import logging
+import sys
 import os
 from datetime import datetime
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+
+# 1. Dynamically calculate the project root (the outer '/app' dir in Horizon)
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 2. Inject the project root into sys.path
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from app.database import Base, SessionLocal, engine
 from app.models import Job
