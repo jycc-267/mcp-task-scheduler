@@ -182,7 +182,6 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=default_port, help="Port to bind to for SSE transport")
     args = parser.parse_args()
 
-    Base.metadata.create_all(bind=engine)
     start_scheduler()
 
     if args.transport == "sse":

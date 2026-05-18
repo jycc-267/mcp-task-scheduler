@@ -29,13 +29,14 @@ class Job(Base):
     )
 
     __table_args__ = (
-        # 建立專為 Watcher 設計的「部分索引」
-        # 只有 pending 的任務會進入索引，優化故障恢復時的範圍查詢 (<=)
+        # Create a partial index designed for the Watcher.
+        # Only pending tasks enter the index, optimizing range queries (<=) during fault recovery.
         Index(
             "idx_pending_scheduler",
             "time_bucket", 
             "scheduled_at",
-            sqlite_where=text("status = 'pending'")  # 一旦任務被queued，它就會從索引中被剔除。
+            sqlite_where=text("status = 'pending'"),  # Once a task is queued, it is removed from the index.
+            postgresql_where=text("status = 'pending'")
         ),
         Index("idx_bucket_status", "time_bucket", "status"),
     )

@@ -46,14 +46,14 @@ To transition the MCP task scheduler from a local SQLite setup to a production-g
    - Risk: Low
 
 ### Phase 2: Schema Migration & Infrastructure Provisioning
-4. **Provision Cloud SQL** (File: N/A - gcloud CLI)
+4. **Provision Cloud SQL (Already Done)**
    - Action: Create a PostgreSQL 16 instance and target database. Store the Unix Socket connection string in Google Secret Manager (`postgresql+pg8000://<USER>:<PASS>@/task_scheduler?unix_sock=/cloudsql/<PROJECT>:<REGION>:<INSTANCE>/.s.PGSQL.5432`).
    - Why: Sets up the managed persistence layer.
    - Dependencies: None
    - Risk: Low
 
 5. **Create Schema Migration Job** (File: `app/migrate.py`)
-   - Action: Create a new short-lived script `app/migrate.py` that simply imports models, engine, and runs `Base.metadata.create_all(bind=engine)`.
+   - Action: Create a new short-lived script `app/migrate.py` that simply imports models, engine, and runs `Base.metadata.create_all(bind=engine)`. Remove `Base.metadata.create_all(bind=engine)` from `app/mcp_server.py`.
    - Why: **When and how do I write the model schema?** Running `create_all()` on application startup inside `app/mcp_server.py` creates a severe race condition in Cloud Run. If multiple instances spin up simultaneously, they will clash trying to create the same tables. The schema should be executed exactly once via a standalone **Cloud Run Job** running `uv run python -m app.migrate` before deploying the main service.
    - Dependencies: Step 1, 2
    - Risk: Medium

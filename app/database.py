@@ -1,19 +1,28 @@
+import os
 import sqlite3
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from sqlalchemy.pool import QueuePool
 
-DATABASE_URL = "sqlite:///./chatgpt_task.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./chatgpt_task.db")
 
-# Enforce strict connection pooling to handle concurrent DB access
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False, "timeout": 15},
-    poolclass=QueuePool,
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
-)
+if DATABASE_URL.startswith("postgresql"):
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=1,
+        max_overflow=2,
+        pool_recycle=1800,
+    )
+else:
+    # Enforce strict connection pooling to handle concurrent DB access
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False, "timeout": 15},
+        poolclass=QueuePool,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=30,
+    )
 
 @event.listens_for(engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
