@@ -1,21 +1,25 @@
 # Project Architecture Overview
 
 ## Executive Summary
-This project is a **ChatGPT Task Scheduler Prototype**, implemented as a Model Context Protocol (MCP) server. It allows users (typically through an AI assistant like Claude) to schedule, list, monitor, and cancel future tasks. The system is designed with a decoupled architecture that separates the API/Interface layer from the background execution logic, ensuring scalability and reliability.
+The MCP Task Scheduler is a robust, production-grade scheduling service designed to bridge the gap between natural language commands (via the Model Context Protocol, MCP) and background job execution. It has evolved from a local SQLite prototype into a scalable **GCP-managed architecture**. Leveraging **Cloud Run** for zero-maintenance compute and **Cloud SQL (PostgreSQL 15)** for concurrent database access, the system allows users to schedule, manage, and execute delayed or recurring tasks described in natural language. An integrated **Gemini LLM** parser transforms raw user prompts into structured tasks, and background worker threads execute these tasks using optimized split-transactions.
 
-The core technology stack consists of **Python 3.13**, using the **mcp** and **fastmcp** SDKs for the server interface, **SQLAlchemy** for database ORM, and **SQLite** as the persistent storage layer. The project is managed using the **uv** package manager.
+The core technology stack consists of **Python 3.13**, using the **mcp** and **fastmcp** SDKs for the server interface, **SQLAlchemy** for database ORM, and the **uv** package manager.
 
 ## File Structure
 ```text
 .
+├── deploy.sh            # GCP deployment script for Cloud Run and Cloud SQL
+├── Dockerfile           # Multi-stage Docker build for runtime container
+├── pyproject.toml       # Project dependencies and configuration
 ├── app/
 │   ├── __init__.py
-│   ├── database.py      # SQLAlchemy setup and session management
+│   ├── database.py      # SQLAlchemy setup and Cloud SQL IAM authentication
+│   ├── llm_parser.py    # Gemini-based NLP parser mapping queries to task schemas
 │   ├── mcp_server.py    # MCP server implementation and tool handlers
+│   ├── migrate.py       # Idempotent schema migration scripts
 │   ├── models.py        # Database models (Job) and DB indices
-│   └── scheduler.py     # Background watcher and worker threads
+│   └── scheduler.py     # Background watcher, worker, and reaper threads
 ├── artifacts/           # Project specifications and architecture docs
-├── pyproject.toml       # Project dependencies and configuration
 ├── README.md            # Project overview and setup instructions
 └── PROMPT.md            # System requirements and design questions
 ```
@@ -23,57 +27,68 @@ The core technology stack consists of **Python 3.13**, using the **mcp** and **f
 ## Module Functionalities
 
 ### `app/`
-- **`database.py`**: Configures the SQLite database connection using SQLAlchemy. It provides the `engine`, `SessionLocal`, and a `get_db` generator for session management.
-- **`models.py`**: Defines the `Job` database model, which tracks task descriptions, scheduled execution times, statuses (pending, queued, running, completed, failed, cancelled), and results. It incorporates advanced database optimizations, such as **Partial Indices** (`idx_pending_scheduler`), to drastically improve watcher loop efficiency by only indexing pending jobs.
-- **`scheduler.py`**: Contains the background execution logic.
-    - `get_time_bucket`: Converts scheduled times to an hourly bucket string (e.g., `2025030114`), acting as a partition key for efficient database querying.
+- **`database.py`**: Configures the database connection using SQLAlchemy. It supports dynamic Cloud SQL IAM authentication using `google-cloud-sql-connector` for passwordless connections in production, while falling back to standard URLs or SQLite for local development.
+- **`models.py`**: Defines the `Job` database model, tracking task parameters (scheduled times, cron expressions, timezones) and statuses (pending, running, completed, failed, cancelled). It incorporates advanced optimizations, such as **Partial Indices** (`idx_pending_scheduler`), to drastically improve watcher loop efficiency by only indexing pending jobs.
+- **`scheduler.py`**: Contains the core background execution logic.
+    - `get_time_bucket`: Converts scheduled times to an hourly bucket string, acting as a partition key for efficient database querying.
     - `find_due_jobs`: Utilizes partial indices and time buckets to swiftly query due jobs without full table scans.
-    - `watcher_loop`: Periodically scans the database for jobs that are due and pushes them to an in-memory queue.
-    - `worker_loop`: Pulls jobs from the queue and simulates execution, updating their status in the database.
-    - `start_scheduler`: Initializes and starts the watcher and worker as daemon threads.
-- **`mcp_server.py`**: The main entry point for the MCP server.
-    - Defines MCP tools: `task_create`, `task_list`, `task_status`, and `task_cancel`.
-    - Implements pure business logic tool handlers that interact with the database via injected sessions.
-    - Uses a `TOOL_REGISTRY` pattern to route incoming MCP tool calls to the appropriate handlers cleanly.
+    - `watcher_loop`: A read-only thread that periodically scans the database for due jobs and pushes their IDs to an in-memory queue.
+    - `worker_loop`: Pulls jobs from the queue and executes them using the Gemini LLM API via a split-transaction pattern to protect connection pools.
+    - `reaper_loop`: A fault-tolerance thread that recovers jobs stuck in the 'running' state if a worker crashes.
+    - `start_scheduler`: Initializes and starts the background daemon threads.
+- **`mcp_server.py`**: Acts as the primary entry point and strict middleware boundary for the MCP server.
+    - Defines MCP tools: `task_create`, `task_list`, `task_status`, `task_cancel`, and `nlp_task_create`.
+    - Handles incoming natural language requests and delegates parsing to the LLM parser before interacting with the database.
+- **`llm_parser.py`**: A specialized LLM parser using Pydantic schemas. It intercepts free-form natural language queries and strictly parses them into deterministic scheduling parameters before database insertion.
+- **`migrate.py`**: Handles database schema migrations idempotently, introspecting existing tables and applying necessary permissions (e.g., `GRANT ALL ... TO public` for PostgreSQL 15+).
 
 ## Architecture & Data Flow
 
-The system follows a producer-consumer pattern mediated by a database and an in-memory queue.
+The system follows a producer-consumer pattern mediated by a PostgreSQL database and an in-memory queue, deployed across managed GCP services.
 
 ```mermaid
 graph TD
-    User((User/LLM)) -->|MCP Tool Call| Server[MCP Server]
-    Server -->|Create/Update Job| DB[(SQLite DB)]
+    User((User/LLM Client)) -->|MCP Tool Call| Server[Cloud Run: MCP Server]
     
-    subgraph Background Process
-        Watcher[Watcher Thread] -->|Poll Due Jobs| DB
+    subgraph GCP Cloud Run Instance
+        Server -->|Parse NLP| LLMParser[llm_parser.py]
+        LLMParser -.->|API Call| Gemini[Gemini API]
+        Server -->|Create/Update Job| DB[(Cloud SQL: PostgreSQL)]
+        
+        Watcher[Watcher Thread] -->|O 1 Poll Due Jobs| DB
         Watcher -->|Push Job ID| Queue[In-memory Queue]
         Queue -->|Pull Job ID| Worker[Worker Thread]
-        Worker -->|Execute & Update| DB
+        
+        Worker -.->|Long-running API Call| Gemini
+        Worker -->|Fast Tx Update| DB
+        
+        Reaper[Reaper Thread] -->|Recover Stuck Jobs| DB
     end
 ```
 
 ### Step-by-Step Flow:
-1. **Task Creation**: A user provides a task description and a scheduled time. The MCP server calls `task_create`, which saves a new `Job` record to the database with a `pending` status and computes its `time_bucket`.
-2. **Watching**: The `watcher_loop` runs every 10 seconds (default). It efficiently queries the DB using the `time_bucket` and partial indices for `pending` jobs where `scheduled_at <= now()`.
-3. **Queuing**: Found jobs are updated to `queued` status and their IDs are pushed to the `job_queue`.
-4. **Execution**: The `worker_loop` waits for IDs in the `job_queue`. When an ID is received, it updates the job status to `running`, performs the task (simulated), and then updates the status to `completed` (or `failed`) with the result.
+1. **Task Creation**: A user provides a natural language task description. The MCP server calls `nlp_task_create`, routes it to `llm_parser.py` (which uses Gemini to extract structured data), and saves a new `Job` record to the database with a `pending` status.
+2. **Watching**: The read-only `watcher_loop` runs every 10 seconds. It efficiently queries the DB using the `time_bucket` and partial indices for `pending` jobs where `scheduled_at <= now()`.
+3. **Queuing**: Found job IDs are tracked in a `ThreadSafeSet` to simulate a "queued" state without write-lock penalties, and their IDs are pushed to the `GLOBAL_JOB_QUEUE`.
+4. **Execution**: The `worker_loop` waits for IDs. It uses a **split-transaction**: first, a fast DB update sets the status to `running`. The session closes, and the LLM execution runs. Finally, a second fast transaction saves the result and marks it `completed`.
+5. **Recovery**: If a worker crashes mid-execution, the `reaper_loop` identifies tasks stuck in `running` for > 5 minutes and resets them to `pending`.
 
 ## Dependencies & Tech Stack
 - **Core Framework**: [mcp](https://modelcontextprotocol.io/), [fastmcp](https://github.com/jlowin/fastmcp)
-- **Data Layer**: SQLAlchemy 2.0, SQLite
-- **Project Management**: [uv](https://github.com/astral-sh/uv)
-- **Testing**: [pytest](https://docs.pytest.org/), [MCP Inspector](https://github.com/modelcontextprotocol/inspector)
+- **Data Layer**: SQLAlchemy 2.0, Cloud SQL PostgreSQL 15 (via `pg8000` & `google-cloud-sql-connector`)
+- **AI / LLM**: `google-genai` (Gemini 2.5 API)
+- **Infrastructure**: GCP Cloud Run, Cloud SQL, Secret Manager, Artifact Registry
+- **Project Management**: [uv](https://github.com/astral-sh/uv), Docker
 
 ## Architectural Standards & Patterns
-- **Watcher/Worker Separation**: Decouples job discovery (scanning) from job execution, allowing them to scale or fail independently.
-- **Queueing Layer**: Protects the database from excessive polling by the worker and ensures tasks are processed in order.
-- **Registry Pattern**: The MCP server uses a dictionary-based registry (`TOOL_REGISTRY`) to map tool names to handler functions, facilitating easier extension without long conditional blocks.
-- **Time Bucket Partitioning**: Jobs are grouped into hourly buckets to optimize database queries, preventing performance degradation as the number of jobs grows.
-- **Partial Indexing for Watcher Optimization**: A SQLite partial index (`idx_pending_scheduler`) is specifically built over pending jobs to ensure fast fault recovery queries without the overhead of indexing completed tasks.
-- **Immutability & Dependency Injection**: Following coding standards, the system avoids mutating shared state where possible, and passes dependencies (like the DB session) directly into tool handlers to decouple logic from connections.
+- **Split-Transaction Worker**: External network I/O (Gemini calls) must never be performed while holding an active database session/connection. This prevents `QueuePool` exhaustion.
+- **Read-Only Watcher**: Polling threads must not perform database writes (like updating a status to 'queued') to avoid write-lock contention. The UI dynamically projects the 'queued' state using an in-memory `ThreadSafeSet`.
+- **Stateless IAM Security**: No hardcoded passwords or `.env` files are used in production. Cloud Run explicitly binds to a Service Account, and the connector requests short-lived OAuth2 tokens for database authentication.
+- **Middleware Guardrails**: Raw LLM outputs are never trusted. All natural language inputs must be strictly coerced into Pydantic schemas by a secondary parser before interacting with core application logic.
+- **Queueing Layer**: Protects the database from excessive polling by the worker and ensures tasks are processed sequentially within an instance.
+- **Time Bucket Partitioning & Partial Indices**: Jobs are grouped into hourly buckets, and a partial index (`idx_pending_scheduler`) strictly over pending jobs ensures fast fault recovery queries without the overhead of indexing millions of completed tasks.
 
 ## Best Practices for Execution
-1. **Thread Safety**: The SQLAlchemy engine is configured with `check_same_thread=False` to allow multi-threaded access from the watcher, worker, and MCP server.
-2. **Error Handling**: Worker execution is wrapped in try-except blocks to ensure job failures are captured and recorded in the database without crashing the worker thread.
-3. **Graceful Shutdown**: Background threads are started as `daemon=True`, ensuring they terminate when the main MCP server process exits.
+1. **Thread Safety**: The system safely manages concurrent watcher, worker, and MCP server access via proper session handling and `ThreadSafeSet` primitives.
+2. **Error Handling & Timeouts**: Worker execution is wrapped in try-except blocks, and LLM calls use a `ThreadPoolExecutor` with a strict `timeout=60` to ensure hung Gemini API calls do not permanently block threads.
+3. **Graceful Shutdown**: Background threads are started as `daemon=True`, ensuring they terminate when the main Cloud Run container exits.
