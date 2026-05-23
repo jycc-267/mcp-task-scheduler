@@ -26,3 +26,6 @@ contexts/
 chatgpt_task.db
 chatgpt_task.db-shm
 chatgpt_task.db-wal
+
+deploy.sh
+Dockerfile
