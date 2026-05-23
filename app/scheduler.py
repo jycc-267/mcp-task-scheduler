@@ -224,6 +224,7 @@ def worker_loop():
         cron_expr = None
         scheduled_at = None
         parent_job_id = None
+        timezone = None
 
         # Transaction 1: Fast read + mark running
         try:
@@ -238,6 +239,7 @@ def worker_loop():
                 cron_expr = job.cron_expr
                 scheduled_at = job.scheduled_at
                 parent_job_id = job.parent_job_id
+                timezone = job.timezone
                 job.status = "running"
                 db.commit()
         except Exception as e:
@@ -281,13 +283,28 @@ def worker_loop():
                 # Check if job is recurring
                 if cron_expr and scheduled_at:
                     try:
-                        next_time = croniter(cron_expr, scheduled_at).get_next(datetime)
+                        import zoneinfo
+                        # Use the user's timezone if present, otherwise default to UTC
+                        tz_name = timezone or "UTC"
+                        tz = zoneinfo.ZoneInfo(tz_name)
+                        
+                        # Convert naive scheduled_at (which is stored in UTC) to a timezone-aware datetime in user's timezone
+                        local_scheduled_at = scheduled_at.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(tz)
+                        
+                        # Calculate the next occurrence in local time
+                        iter_cron = croniter(cron_expr, local_scheduled_at)
+                        next_local = iter_cron.get_next(datetime)
+                        
+                        # Convert the next local time back to naive UTC for storage
+                        next_utc = next_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+                        
                         new_job = Job(
                             description=description,
-                            scheduled_at=next_time,
-                            time_bucket=get_time_bucket(next_time),
+                            scheduled_at=next_utc,
+                            time_bucket=get_time_bucket(next_utc),
                             cron_expr=cron_expr,
                             parent_job_id=parent_job_id,
+                            timezone=tz_name,
                         )
                         db.add(new_job)
                     except Exception as cron_err:

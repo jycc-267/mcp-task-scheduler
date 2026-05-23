@@ -21,6 +21,7 @@ class Job(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending, queued, running, completed, failed, cancelled
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     cron_expr: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    timezone: Mapped[str] = mapped_column(String(50), default="UTC", server_default=text("'UTC'"))
     parent_job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
     logs: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
