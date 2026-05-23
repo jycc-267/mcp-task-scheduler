@@ -21,6 +21,7 @@ class Job(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending, queued, running, completed, failed, cancelled
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     cron_expr: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    timezone: Mapped[str] = mapped_column(String(50), default="UTC", server_default=text("'UTC'"))
     parent_job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
     logs: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
@@ -29,13 +30,14 @@ class Job(Base):
     )
 
     __table_args__ = (
-        # 建立專為 Watcher 設計的「部分索引」
-        # 只有 pending 的任務會進入索引，優化故障恢復時的範圍查詢 (<=)
+        # Create a partial index designed for the Watcher.
+        # Only pending tasks enter the index, optimizing range queries (<=) during fault recovery.
         Index(
             "idx_pending_scheduler",
-            "time_bucket",
+            "time_bucket", 
             "scheduled_at",
-            postgresql_where=text("status = 'pending'"),  # 一旦任務被queued，它就會從索引中被剔除。
+            sqlite_where=text("status = 'pending'"),  # Once a task is queued, it is removed from the index.
+            postgresql_where=text("status = 'pending'")
         ),
         Index("idx_bucket_status", "time_bucket", "status"),
     )

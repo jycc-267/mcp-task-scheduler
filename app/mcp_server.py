@@ -29,12 +29,13 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("task-scheduler")
 
 @mcp.tool()
-def task_create(description: str, scheduled_at: str, cron_expr: str | None = None, parent_job_id: int | None = None) -> dict:
+def task_create(description: str, scheduled_at: str, user_timezone: str = "UTC", cron_expr: str | None = None, parent_job_id: int | None = None) -> dict:
     """Schedule a new task for future execution.
     
     Args:
         description: What the task should do
         scheduled_at: When to run, ISO 8601 format (e.g. 2026-05-03T10:00:00)
+        user_timezone: The IANA timezone name of the user (e.g., 'America/New_York', 'Asia/Taipei', 'Europe/London'). Deduce this from the user's request, context or system instructions. If unknown, default to 'UTC'.
         cron_expr: Optional cron expression for recurring tasks (e.g. '0 9 * * *' for daily at 9am)
         parent_job_id: Optional ID of a parent job that must complete before this job runs
     """
@@ -45,7 +46,8 @@ def task_create(description: str, scheduled_at: str, cron_expr: str | None = Non
             scheduled_at=dt,
             time_bucket=get_time_bucket(dt),
             cron_expr=cron_expr,
-            parent_job_id=parent_job_id
+            parent_job_id=parent_job_id,
+            timezone=user_timezone
         )
         db.add(job)
         db.commit()
@@ -55,7 +57,8 @@ def task_create(description: str, scheduled_at: str, cron_expr: str | None = Non
             "status": job.status, 
             "scheduled_at": str(job.scheduled_at),
             "cron_expr": job.cron_expr,
-            "parent_job_id": job.parent_job_id
+            "parent_job_id": job.parent_job_id,
+            "user_timezone": job.timezone
         }
 
 @mcp.tool()
@@ -81,6 +84,7 @@ def task_status(job_id: int) -> dict:
             "scheduled_at": str(job.scheduled_at),
             "cron_expr": job.cron_expr,
             "parent_job_id": job.parent_job_id,
+            "user_timezone": job.timezone,
             "result": job.result,
         }
 
@@ -108,7 +112,8 @@ def task_list(limit: int = 100, offset: int = 0) -> dict:
                     "status": "queued" if j.status == "pending" and j.id in enqueued_job_ids else j.status,
                     "scheduled_at": str(j.scheduled_at),
                     "cron_expr": j.cron_expr,
-                    "parent_job_id": j.parent_job_id
+                    "parent_job_id": j.parent_job_id,
+                    "user_timezone": j.timezone
                 }
                 for j in jobs
             ]
@@ -132,7 +137,7 @@ def task_cancel(job_id: int) -> dict:
         return {"job_id": job.id, "status": "cancelled"}
 
 @mcp.tool()
-async def nlp_task_create(query: str) -> dict:
+async def nlp_task_create(query: str, user_timezone: str = "UTC") -> dict:
     """Create a task from a natural language description using LLM parsing.
 
     Takes a free-form text query (e.g., "Summarize the news every Friday at 5pm")
@@ -141,11 +146,12 @@ async def nlp_task_create(query: str) -> dict:
 
     Args:
         query: Natural language description of the task to schedule
+        user_timezone: The IANA timezone name of the user (e.g., 'America/New_York', 'Asia/Taipei', 'Europe/London'). Deduce this from the user's request, context or system instructions. If unknown, default to 'UTC'.
     """
     from app.llm_parser import parse_task
 
     try:
-        schema = await parse_task(query)
+        schema = await parse_task(query, default_timezone=user_timezone)
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:
@@ -164,6 +170,7 @@ async def nlp_task_create(query: str) -> dict:
     return task_create(
         description=schema.description,
         scheduled_at=schema.scheduled_at,
+        user_timezone=schema.user_timezone,
         cron_expr=schema.cron_expr,
         parent_job_id=parent_job_id,
     )
@@ -182,7 +189,6 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=default_port, help="Port to bind to for SSE transport")
     args = parser.parse_args()
 
-    Base.metadata.create_all(bind=engine)
     start_scheduler()
 
     if args.transport == "sse":

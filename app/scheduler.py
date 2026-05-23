@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from google import genai
 from sqlalchemy.orm import Session, aliased
-from sqlalchemy import select, update
+from sqlalchemy import select
 from croniter import croniter
 
 from app.database import SessionLocal
@@ -126,24 +126,24 @@ def reaper_loop(interval: int = 300):
         try:
             with SessionLocal() as db:
                 stuck_threshold = _utcnow() - timedelta(minutes=5)
-                stuck_query = (
-                    select(Job.id)
-                    .where(Job.status == "running")
-                    .where(Job.updated_at < stuck_threshold)
+                stuck_jobs = (
+                    db.query(Job.id)
+                    .filter(Job.status == "running")
+                    .filter(Job.updated_at < stuck_threshold)
+                    .all()
                 )
-                stuck_jobs = list(db.execute(stuck_query).scalars().all())
                 if stuck_jobs:
-                    # Atomic update: prevents race condition where a worker completes the job
+                    stuck_ids = [j[0] for j in stuck_jobs]
+                    # Atomic update: prevents race condition where a worker completes the job 
                     # right after the Reaper queries it.
-                    stmt = (
-                        update(Job)
-                        .where(Job.id.in_(stuck_jobs), Job.status == "running")
-                        .values(status="pending")
+                    updated_count = (
+                        db.query(Job)
+                        .filter(Job.id.in_(stuck_ids), Job.status == "running")
+                        .update({"status": "pending"}, synchronize_session=False)
                     )
-                    result = db.execute(stmt)
                     db.commit()
-                    if result.rowcount > 0:
-                        for j_id in stuck_jobs:
+                    if updated_count > 0:
+                        for j_id in stuck_ids:
                             logger.warning(
                                 "Reaper recovering stuck job %d (resetting to pending)", j_id
                             )
@@ -224,11 +224,12 @@ def worker_loop():
         cron_expr = None
         scheduled_at = None
         parent_job_id = None
+        timezone = None
 
         # Transaction 1: Fast read + mark running
         try:
             with SessionLocal() as db:
-                job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+                job = db.query(Job).filter(Job.id == job_id).first()
                 if job is None or job.status != "pending":
                     enqueued_job_ids.discard(job_id)
                     GLOBAL_JOB_QUEUE.task_done()
@@ -238,6 +239,7 @@ def worker_loop():
                 cron_expr = job.cron_expr
                 scheduled_at = job.scheduled_at
                 parent_job_id = job.parent_job_id
+                timezone = job.timezone
                 job.status = "running"
                 db.commit()
         except Exception as e:
@@ -263,7 +265,7 @@ def worker_loop():
         # Transaction 2: Fast write of result
         try:
             with SessionLocal() as db:
-                job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+                job = db.query(Job).filter(Job.id == job_id).first()
                 if job is None:
                     logger.error("Job %d disappeared between transactions.", job_id)
                     continue
@@ -281,13 +283,28 @@ def worker_loop():
                 # Check if job is recurring
                 if cron_expr and scheduled_at:
                     try:
-                        next_time = croniter(cron_expr, scheduled_at).get_next(datetime)
+                        import zoneinfo
+                        # Use the user's timezone if present, otherwise default to UTC
+                        tz_name = timezone or "UTC"
+                        tz = zoneinfo.ZoneInfo(tz_name)
+                        
+                        # Convert naive scheduled_at (which is stored in UTC) to a timezone-aware datetime in user's timezone
+                        local_scheduled_at = scheduled_at.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(tz)
+                        
+                        # Calculate the next occurrence in local time
+                        iter_cron = croniter(cron_expr, local_scheduled_at)
+                        next_local = iter_cron.get_next(datetime)
+                        
+                        # Convert the next local time back to naive UTC for storage
+                        next_utc = next_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+                        
                         new_job = Job(
                             description=description,
-                            scheduled_at=next_time,
-                            time_bucket=get_time_bucket(next_time),
+                            scheduled_at=next_utc,
+                            time_bucket=get_time_bucket(next_utc),
                             cron_expr=cron_expr,
                             parent_job_id=parent_job_id,
+                            timezone=tz_name,
                         )
                         db.add(new_job)
                     except Exception as cron_err:
@@ -298,7 +315,7 @@ def worker_loop():
             logger.error("Worker error writing result for job %d: %s", job_id, e)
             try:
                 with SessionLocal() as db:
-                    job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+                    job = db.query(Job).filter(Job.id == job_id).first()
                     # Only reset to pending if it wasn't cancelled by the user
                     if job and job.status == "running":
                         # Visibility Reset: return to pending so Watcher can retry

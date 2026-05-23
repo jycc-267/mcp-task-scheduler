@@ -5,10 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "cloud-sql-python-connector[pg8000]>=1.20.2",
     "croniter>=6.2.2",
     "fastmcp>=3.2.4",
     "google-genai>=2.0.1",
     "mcp>=1.0.0",
+    "pg8000>=1.31.5",
     "psycopg2-binary>=2.9.12",
     "python-dotenv>=1.2.2",
     "sqlalchemy==2.0.36",
