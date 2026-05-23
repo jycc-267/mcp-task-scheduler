@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "cloud-sql-python-connector[pg8000]>=1.20.2",
     "croniter>=6.2.2",
     "fastmcp>=3.2.4",
     "google-genai>=2.0.1",
