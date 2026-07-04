@@ -95,13 +95,13 @@ To understand *why* the system is structured the way it is, we must look at the 
 3.  **The Reaper:** A background thread that sweeps the DB for jobs where `status = 'running'` AND `updated_at < (now - 5 minutes)`.
 **The "Why":** If a worker thread hard-crashes (e.g., OOM kill, unhandled exception) while executing an LLM call, the job is stuck in the `running` state forever, and its ID is lost from the `queue.Queue`. The Reaper acts as the visibility timeout expiration. By resetting the status from `running` back to `pending`, it "un-hides" the job, allowing the Watcher to re-discover it on the next cycle and enqueue it for a healthy worker.
 
-### 4.4. MCP Tools as Middleware for LLM Guardrails
+### 4.4. MCP Server as the Interface Boundary
 **Motivation:** When exposing task scheduling directly to an LLM (like Claude Desktop) via the MCP (Model Context Protocol), raw LLM output is notoriously unpredictable. An LLM might hallucinate dates, misunderstand timezone conversions, or provide malformed cron expressions.
-**The Design:** The MCP server (`mcp_server.py`) acts as strict middleware between the LLM client and the database.
-1.  **Structured Parsing:** The `nlp_task_create` tool doesn't just trust raw text. It routes the text through a secondary LLM call (`llm_parser.py`) strictly constrained by a Pydantic `TaskSchema`.
-2.  **Schema Enforcement:** The Pydantic model enforces types, validates ISO 8601 datetimes, and ensures cron expressions are syntactically valid before any DB interaction occurs.
-3.  **Context Injection:** The MCP tool definition injects the user's implicit timezone into the prompt, forcing the LLM to resolve relative times ("tomorrow at 3pm") accurately against the user's local context before normalizing to UTC for DB storage.
-**The "Why":** By placing the MCP server as a strict enforcement layer, the core application logic never has to deal with fuzzy, malformed, or hallucinated data. If the LLM fails to generate a valid schema, the error is caught at the MCP boundary and returned to the client as an error string, allowing the client LLM to self-correct rather than corrupting the database.
+**The Design:** The MCP server (`mcp_server.py`) acts as the strict interface boundary, relying on the native capabilities of modern MCP clients to format inputs correctly.
+1.  **Direct Tool Exposure:** FastMCP directly exposes the tools (like `task_create` and `task_cancel`).
+2.  **Schema Enforcement:** The function signatures, type hints, and docstrings serve as the schema. The MCP client (e.g., Claude) is responsible for interpreting the prompt, understanding the schema, and executing the tool with correctly structured parameters.
+3.  **Autonomous Execution:** The background worker independently consumes jobs from the database and acts as its own autonomous LLM client to execute the tasks, entirely decoupled from the initial user request.
+**The "Why":** Standard MCP philosophy dictates avoiding a "two-brain conflict." By removing intermediate LLM parsing middleware, the primary client LLM retains full context and reasoning ability, routing directly to the core application logic.
 
 ---
 

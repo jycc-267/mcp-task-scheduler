@@ -169,7 +169,7 @@ def _get_gemini_client_sync() -> genai.Client | None:
     return genai.Client(api_key=api_key)
 
 
-def _execute_with_llm(client: genai.Client, description: str) -> str:
+def _execute_with_llm(client: genai.Client, description: str) -> tuple[str, float, int, int]:
     """Send a job description to the Gemini API and return the response.
 
     Uses a ThreadPoolExecutor to enforce LLM_TIMEOUT_SECONDS, preventing
@@ -180,12 +180,13 @@ def _execute_with_llm(client: genai.Client, description: str) -> str:
         description: The job description to process.
 
     Returns:
-        The LLM's text response.
+        A tuple of (text_response, latency_seconds, input_tokens, output_tokens).
 
     Raises:
         TimeoutError: If the Gemini API call exceeds LLM_TIMEOUT_SECONDS.
         Exception: Propagated from the Gemini SDK on API failures.
     """
+    start_time = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
             client.models.generate_content,
@@ -201,7 +202,15 @@ def _execute_with_llm(client: genai.Client, description: str) -> str:
             raise TimeoutError(
                 f"Gemini API call timed out after {LLM_TIMEOUT_SECONDS}s"
             ) from None
-    return response.text
+            
+    latency = time.time() - start_time
+    in_tokens = 0
+    out_tokens = 0
+    if hasattr(response, 'usage_metadata') and response.usage_metadata:
+        in_tokens = getattr(response.usage_metadata, 'prompt_token_count', 0)
+        out_tokens = getattr(response.usage_metadata, 'candidates_token_count', 0)
+        
+    return response.text, latency, in_tokens, out_tokens
 
 
 # scale out with this pattern, does it solve starvation when worker scale out ? 
@@ -217,6 +226,7 @@ def worker_loop():
     This prevents QueuePool exhaustion when LLM calls take 5-60+ seconds.
     """
     gemini_client = _get_gemini_client_sync()
+    worker_name = threading.current_thread().name
 
     while True:
         job_id = GLOBAL_JOB_QUEUE.get() # should we persist failed job_id in the queue?
@@ -225,6 +235,11 @@ def worker_loop():
         scheduled_at = None
         parent_job_id = None
         timezone = None
+        
+        exec_logs = []
+        def add_log(msg: str):
+            ts = _utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            exec_logs.append(f"[{ts}] [{worker_name}] {msg}")
 
         # Transaction 1: Fast read + mark running
         try:
@@ -242,6 +257,8 @@ def worker_loop():
                 timezone = job.timezone
                 job.status = "running"
                 db.commit()
+            
+            add_log("Job execution started")
         except Exception as e:
             logger.error("Failed to start job %d: %s", job_id, e)
             enqueued_job_ids.discard(job_id)
@@ -250,17 +267,18 @@ def worker_loop():
 
         # LLM call runs OUTSIDE any DB session — pool connection is fully released
         result_text = f"Executed (no LLM): {description}"
-        llm_log = None
         if gemini_client is not None:
+            add_log(f"Dispatching to LLM model: {GEMINI_MODEL}")
             try:
-                result_text = _execute_with_llm(gemini_client, description)
+                result_text, latency, in_tokens, out_tokens = _execute_with_llm(gemini_client, description)
                 logger.info("Job %d executed via LLM successfully.", job_id)
+                add_log(f"LLM execution successful (Latency: {latency:.2f}s, Tokens: {in_tokens} in / {out_tokens} out)")
             except Exception as llm_err:
                 logger.error(
                     "LLM execution failed for job %d: %s", job_id, llm_err
                 )
                 result_text = f"LLM error: {llm_err}"
-                llm_log = f"LLM error: {llm_err}"
+                add_log(f"LLM error: {llm_err}")
 
         # Transaction 2: Fast write of result
         try:
@@ -277,8 +295,6 @@ def worker_loop():
 
                 job.result = result_text
                 job.status = "completed"
-                if llm_log:
-                    job.logs = (job.logs or "") + f"\n{llm_log}"
 
                 # Check if job is recurring
                 if cron_expr and scheduled_at:
@@ -307,8 +323,12 @@ def worker_loop():
                             timezone=tz_name,
                         )
                         db.add(new_job)
+                        add_log(f"Cron expression '{cron_expr}' resolved. Next run scheduled for {next_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
                     except Exception as cron_err:
-                        job.logs = (job.logs or "") + f"\nCron scheduling failed: {cron_err}"
+                        add_log(f"Cron scheduling failed: {cron_err}")
+
+                add_log(f"Job finished with status: {job.status}")
+                job.logs = (job.logs or "") + ("\n" if job.logs else "") + "\n".join(exec_logs)
 
                 db.commit()
         except Exception as e:
@@ -321,7 +341,9 @@ def worker_loop():
                         # Visibility Reset: return to pending so Watcher can retry
                         # after enqueued_job_ids.discard() in finally block
                         job.status = "pending"
-                        job.logs = (job.logs or "") + f"\nTransient worker error: {e}"
+                        add_log(f"Transient worker error: {e}")
+                        add_log("Job reset to 'pending' for retry.")
+                        job.logs = (job.logs or "") + ("\n" if job.logs else "") + "\n".join(exec_logs)
                         db.commit()
                         logger.info("Job %d reset to 'pending' for retry.", job_id)
             except Exception:

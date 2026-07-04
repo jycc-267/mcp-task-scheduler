@@ -7,7 +7,10 @@ from sqlalchemy.pool import QueuePool
 
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./chatgpt_task.db")
+# Use absolute path for local SQLite to prevent CWD-dependent database creation
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "chatgpt_task.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{DEFAULT_DB_PATH}")
 SERVICE_ACCOUNT = os.environ.get("SERVICE_ACCOUNT")
 PROJECT_ID = os.environ.get("PROJECT_ID")
 DB_REGION = os.environ.get("DB_REGION", "us-central1")

@@ -89,6 +89,23 @@ def task_status(job_id: int) -> dict:
         }
 
 @mcp.tool()
+def task_logs(job_id: int) -> dict:
+    """Get the execution logs of a scheduled task by job_id.
+    
+    Args:
+        job_id: The job ID to fetch logs for
+    """
+    with SessionLocal() as db:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if job is None:
+            return {"error": f"Job {job_id} not found"}
+            
+        return {
+            "job_id": job.id,
+            "logs": job.logs or "No logs available for this job."
+        }
+
+@mcp.tool()
 def task_list(limit: int = 100, offset: int = 0) -> dict:
     """List scheduled tasks with pagination.
 
@@ -136,44 +153,73 @@ def task_cancel(job_id: int) -> dict:
         db.commit()
         return {"job_id": job.id, "status": "cancelled"}
 
-@mcp.tool()
-async def nlp_task_create(query: str, user_timezone: str = "UTC") -> dict:
-    """Create a task from a natural language description using LLM parsing.
 
-    Takes a free-form text query (e.g., "Summarize the news every Friday at 5pm")
-    and uses an LLM to extract structured scheduling parameters, then creates
-    the task automatically.
 
-    Args:
-        query: Natural language description of the task to schedule
-        user_timezone: The IANA timezone name of the user (e.g., 'America/New_York', 'Asia/Taipei', 'Europe/London'). Deduce this from the user's request, context or system instructions. If unknown, default to 'UTC'.
-    """
-    from app.llm_parser import parse_task
+# ===================================================================
+# Resources & Prompts (Phase 4)
+# ===================================================================
 
+@mcp.resource("job://{job_id}/logs")
+def get_job_logs(job_id: int) -> str:
+    """Return live logs and details of a specific job."""
+    with SessionLocal() as db:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if job is None:
+            return f"Job {job_id} not found."
+        return job.logs or "No logs available for this job."
+
+@mcp.resource("system://database-schema")
+def get_database_schema() -> str:
+    """Provide read-only access to the database schema (app/models.py)."""
+    models_path = os.path.join(project_root, "app", "models.py")
     try:
-        schema = await parse_task(query, default_timezone=user_timezone)
-    except ValueError as e:
-        return {"error": str(e)}
+        with open(models_path, "r", encoding="utf-8") as f:
+            return f.read()
     except Exception as e:
-        return {"error": f"LLM parsing failed: {e}"}
+        return f"Could not read schema: {e}"
 
-    parent_job_id = None
-    if schema.dependencies:
-        if len(schema.dependencies) > 1:
-            logger.warning(
-                "nlp_task_create: %d dependencies returned, only first will be used: %s",
-                len(schema.dependencies),
-                schema.dependencies,
-            )
-        parent_job_id = schema.dependencies[0]
-
-    return task_create(
-        description=schema.description,
-        scheduled_at=schema.scheduled_at,
-        user_timezone=schema.user_timezone,
-        cron_expr=schema.cron_expr,
-        parent_job_id=parent_job_id,
+@mcp.prompt("daily_review")
+def daily_review_prompt() -> str:
+    """Aggregate recently completed tasks and upcoming chains for a daily standup/review."""
+    with SessionLocal() as db:
+        recent_jobs = (
+            db.query(Job)
+            .filter(Job.status.in_(["completed", "failed"]))
+            .order_by(Job.updated_at.desc())
+            .limit(10)
+            .all()
+        )
+        upcoming_jobs = (
+            db.query(Job)
+            .filter(Job.status.in_(["pending", "queued"]))
+            .order_by(Job.scheduled_at.asc())
+            .limit(10)
+            .all()
+        )
+        
+    context = "Here is the data from the task scheduler database.\\n\\nRECENTLY COMPLETED/FAILED JOBS:\\n"
+    if not recent_jobs:
+        context += "- None\\n"
+    for j in recent_jobs:
+        context += f"- Job {j.id}: {j.description} (Status: {j.status}, Executed: {j.updated_at})\\n"
+        if j.result:
+            result_excerpt = j.result[:100].replace('\\n', ' ')
+            context += f"  Result excerpt: {result_excerpt}...\\n"
+            
+    context += "\\nUPCOMING PENDING JOBS:\\n"
+    if not upcoming_jobs:
+        context += "- None\\n"
+    for j in upcoming_jobs:
+        context += f"- Job {j.id}: {j.description} (Scheduled: {j.scheduled_at}, Cron: {j.cron_expr})\\n"
+        
+    prompt_text = (
+        f"{context}\\n\\n"
+        "Based on this data, please provide a daily review/standup report for me. "
+        "Highlight any failures or important completed tasks, and summarize what I have coming up."
     )
+    
+    return prompt_text
+
 
 # ===================================================================
 # Entry point

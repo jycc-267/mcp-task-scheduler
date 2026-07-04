@@ -22,7 +22,6 @@ This plan outlines the upgrade of the existing local `stdio`-based MCP task sche
 ## Architecture Changes
 - `app/models.py`: Update `Job` model to support recurring configurations (cron string), dependency mapping (parent/child job IDs), and extended metadata (logs).
 - `app/scheduler.py`: Integrate an async scheduler (like `APScheduler`) or heavily augment the watcher loop to evaluate cron expressions and resolve DAG dependencies.
-- `app/llm_parser.py` (New): Implement the LLM middleware to intercept raw natural language inputs and output structured schemas for `task_create`.
 - `app/mcp_server.py`: Rewrite using `FastMCP` class. Add `@mcp.tool`, `@mcp.resource`, and `@mcp.prompt` decorators. Swap stdio to an SSE/HTTP transport compatible with remote clients.
 
 ## Implementation Steps
@@ -59,24 +58,12 @@ This plan outlines the upgrade of the existing local `stdio`-based MCP task sche
    - Dependencies: None
    - Risk: Low
 
-### Phase 3: LLM Pre-Parsing Middleware
+### Phase 3: Worker LLM Execution
 1. **Implement Worker LLM Execution** (File: `app/scheduler.py`)
    - Action: Update `worker_loop` to instantiate an Gemini client. When executing a job, use the API to process `job.description`, capture the output, and save it to `job.result` in the DB.
    - Why: The background worker thread must act as its own client to execute tasks independently.
    - Dependencies: None
    - Risk: Medium
-
-2. **Implement NLP Parser Tool** (File: `app/llm_parser.py`)
-   - Action: Create a function that takes a natural language string, calls an LLM API, and uses structured outputs to return a validated Pydantic `TaskSchema` (description, scheduled_at, cron_expr, dependencies).
-   - Why: Pre-parses raw user requests into strict parameters before hitting `task_create`.
-   - Dependencies: None
-   - Risk: Medium
-
-3. **Integrate Middleware into MCP** (File: `app/mcp_server.py`)
-   - Action: Create a new tool `@mcp.tool() def nlp_task_create(query: str)` which calls the `llm_parser`, then internally calls the standard `task_create` logic.
-   - Why: Exposes the NLP capability to the MCP client cleanly.
-   - Dependencies: Phase 3, Step 1
-   - Risk: Low
 
 ### Phase 4: Expanded MCP Capabilities (Resources & Prompts)
 1. **Implement Job Resources** (File: `app/mcp_server.py`)
@@ -85,10 +72,22 @@ This plan outlines the upgrade of the existing local `stdio`-based MCP task sche
    - Dependencies: Phase 2, Step 1
    - Risk: Low
 
-2. **Implement Daily Review Prompt** (File: `app/mcp_server.py`)
+2. **Implement Database Schema Resource** (File: `app/mcp_server.py`)
+   - Action: Use `@mcp.resource("system://database-schema")` to read and return the contents of `app/models.py`.
+   - Why: Provides passive data source giving the LLM read-only access to the database schema for accurate query formulation.
+   - Dependencies: None
+   - Risk: Low
+
+3. **Implement Daily Review Prompt** (File: `app/mcp_server.py`)
    - Action: Use `@mcp.prompt("daily_review")` to aggregate recently completed tasks and upcoming chains from the DB, injecting them into a prompt template for the LLM client.
    - Why: Provides contextual aggregation for the user's daily standup/review.
    - Dependencies: Phase 1, Step 1
+   - Risk: Low
+
+4. **Implement Rich Job Execution Logging Strategy** (File: `app/scheduler.py`)
+   - Action: Update the background worker execution loop to explicitly capture execution lifecycle events, worker identity, and full LLM telemetry (Latency, input/output Token Usage from Gemini API).
+   - Why: Relying only on error logs is an anti-pattern. Rich logs provide complete transparency into successful executions, cron resolutions, and exact token costs per job.
+   - Dependencies: Phase 3, Step 1
    - Risk: Low
 
 3. **(Optional) Implement Proactive Result Notifications** (File: `app/scheduler.py` & `app/mcp_server.py`)
@@ -113,8 +112,8 @@ This plan outlines the upgrade of the existing local `stdio`-based MCP task sche
 - [ ] Job B only executes when its parent Job A successfully completes.
 - [ ] `worker_loop` successfully calls the Gemini API to execute tasks independently and stores the result.
 - [ ] (Optional) Completed job results are pushed automatically to the user's chat interface.
-- [ ] `nlp_task_create` successfully uses an LLM to convert "Remind me to call John every Tuesday" into a structured cron job.
 - [ ] `job://{job_id}/logs` successfully returns live job text.
+- [ ] `system://database-schema` successfully returns the models schema.
 - [ ] `daily_review` prompt successfully formats DB data.
 
 ## Best Practices to Enforce
